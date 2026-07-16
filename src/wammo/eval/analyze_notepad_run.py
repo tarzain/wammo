@@ -13,9 +13,11 @@ from wammo.data.notepad import generate_episode, rare_event_rate
 from wammo.eval.divergence_ladder import notepad_divergence_ladder_samples
 from wammo.model.dit import MicroWAMConfig
 from wammo.model.tokenizer import patchify
+from wammo.eval.notepad_pixels import cursor_centroids
 from wammo.notepad_desk import load_spec
 from wammo.train.overfit_notepad_one import NotePadJointModel, normalize_notepad_actions
 from wammo.train.train_notepad_binned_delta import NotePadBinnedDeltaModel
+from wammo.train.train_notepad_hybrid import NotePadHybridModel
 from wammo.train.overfit_one import normalize_frames
 
 
@@ -162,24 +164,6 @@ def delta_by_chunk_position(true_actions: torch.Tensor, pred_delta: torch.Tensor
     return out
 
 
-def cursor_centroids(frames: np.ndarray) -> np.ndarray:
-    spec = load_spec()
-    colors = np.array([spec["cursor"]["color"], spec["cursor"]["hand_color"]], dtype=np.int16)
-    flat = frames.astype(np.int16)
-    positions = np.full((*frames.shape[:2], 2), np.nan, dtype=np.float32)
-    yy, xx = np.indices(frames.shape[2:4])
-    for ep in range(frames.shape[0]):
-        for t in range(frames.shape[1]):
-            pixel = flat[ep, t]
-            mask = np.zeros(pixel.shape[:2], dtype=bool)
-            for color in colors:
-                mask |= np.abs(pixel - color).max(axis=-1) <= 8
-            if mask.any():
-                positions[ep, t, 0] = float(xx[mask].mean())
-                positions[ep, t, 1] = float(yy[mask].mean())
-    return positions
-
-
 def delta_sign_audit(frames: np.ndarray, actions: np.ndarray) -> dict[str, object]:
     positions = cursor_centroids(frames)
     observed = positions[:, 1:] - positions[:, :-1]
@@ -225,6 +209,8 @@ def load_model(run_dir: Path, device: torch.device) -> NotePadJointModel | NoteP
     model_config = MicroWAMConfig(**config_payload["model"])
     if config_payload.get("model_kind") == "notepad_binned_delta":
         model = NotePadBinnedDeltaModel(model_config, key_count=len(load_spec()["keys"])).to(device)
+    elif config_payload.get("model_kind") == "notepad_hybrid":
+        model = NotePadHybridModel(model_config, key_count=len(load_spec()["keys"])).to(device)
     else:
         model = NotePadJointModel(model_config, key_count=len(load_spec()["keys"])).to(device)
     checkpoint = torch.load(run_dir / "checkpoint.pt", map_location=device)
@@ -282,6 +268,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     parser.add_argument("--battery-size", type=int, default=64)
     parser.add_argument("--battery-seed", type=int, default=200_000)
+    parser.add_argument("--probe-train-episodes", type=int, default=256)
+    parser.add_argument("--probe-eval-episodes", type=int, default=64)
+    parser.add_argument("--probe-steps", type=int, default=2000)
+    parser.add_argument("--no-probe", action="store_true")
     return parser.parse_args()
 
 
@@ -337,6 +327,16 @@ def main() -> None:
         "ladder_battery": ladder_summary,
         "metrics_correlations": metrics_correlations(args.run),
     }
+    if not args.no_probe:
+        from wammo.eval.probe_notepad import run_probe
+
+        output["linear_probe"] = run_probe(
+            args.run,
+            device,
+            train_episodes=args.probe_train_episodes,
+            eval_episodes=args.probe_eval_episodes,
+            steps=args.probe_steps,
+        )
     (analysis_dir / "analysis.json").write_text(json.dumps(output, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(output, indent=2))
 

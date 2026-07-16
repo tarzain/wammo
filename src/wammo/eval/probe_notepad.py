@@ -11,23 +11,12 @@ from torch import nn
 import torch.nn.functional as F
 
 from wammo.data.notepad import generate_episode
-from wammo.eval.analyze_notepad_run import cursor_centroids
-from wammo.model.dit import MicroWAMConfig
+from wammo.eval.analyze_notepad_run import load_model
+from wammo.eval.notepad_pixels import cursor_centroids
 from wammo.model.tokenizer import patchify
 from wammo.notepad_desk import load_spec
 from wammo.train.overfit_notepad_one import NotePadJointModel, normalize_notepad_actions
 from wammo.train.overfit_one import normalize_frames
-
-
-def load_model(run_dir: Path, device: torch.device) -> NotePadJointModel:
-    config_payload = json.loads((run_dir / "config.json").read_text())
-    model = NotePadJointModel(MicroWAMConfig(**config_payload["model"]), key_count=len(load_spec()["keys"])).to(device)
-    checkpoint = torch.load(run_dir / "checkpoint.pt", map_location=device)
-    model.load_state_dict(checkpoint["model"])
-    model.eval()
-    for parameter in model.parameters():
-        parameter.requires_grad_(False)
-    return model
 
 
 def make_probe_arrays(episodes: int, seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -199,33 +188,40 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
-    if args.device == "cuda" and not torch.cuda.is_available():
-        raise SystemExit("CUDA requested but unavailable; pass --device cpu")
-    device = torch.device(args.device)
-    model = load_model(args.run, device)
-    train_frames, train_actions, train_positions = make_probe_arrays(args.train_episodes, args.train_seed)
-    eval_frames, eval_actions, eval_positions = make_probe_arrays(args.eval_episodes, args.eval_seed)
+def run_probe(
+    run_dir: Path,
+    device: torch.device,
+    train_episodes: int = 256,
+    eval_episodes: int = 64,
+    train_seed: int = 300_000,
+    eval_seed: int = 400_000,
+    steps: int = 2000,
+    lr: float = 1e-2,
+) -> dict[str, object]:
+    model = load_model(run_dir, device)
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    train_frames, train_actions, train_positions = make_probe_arrays(train_episodes, train_seed)
+    eval_frames, eval_actions, eval_positions = make_probe_arrays(eval_episodes, eval_seed)
     x_train, pos_train, delta_train = extract_features(model, train_frames, train_actions, train_positions, device)
     x_eval, pos_eval, delta_eval = extract_features(model, eval_frames, eval_actions, eval_positions, device)
     chunk_x_train, chunk_delta_train = extract_chunk_video_features(model, train_frames, train_actions, device)
     chunk_x_eval, chunk_delta_eval = extract_chunk_video_features(model, eval_frames, eval_actions, device)
     visible_delta_x_train, visible_delta_y_train = visible_delta_features(chunk_x_train, chunk_delta_train)
     visible_delta_x_eval, visible_delta_y_eval = visible_delta_features(chunk_x_eval, chunk_delta_eval)
-    _, position_metrics = fit_linear_probe(x_train, pos_train, x_eval, pos_eval, args.steps, args.lr, device)
-    _, delta_current_metrics = fit_linear_probe(x_train, delta_train, x_eval, delta_eval, args.steps, args.lr, device)
+    _, position_metrics = fit_linear_probe(x_train, pos_train, x_eval, pos_eval, steps, lr, device)
+    _, delta_current_metrics = fit_linear_probe(x_train, delta_train, x_eval, delta_eval, steps, lr, device)
     _, delta_visible_metrics = fit_linear_probe(
         visible_delta_x_train,
         visible_delta_y_train,
         visible_delta_x_eval,
         visible_delta_y_eval,
-        args.steps,
-        args.lr,
+        steps,
+        lr,
         device,
     )
-    output = {
-        "run": str(args.run),
+    output: dict[str, object] = {
+        "run": str(run_dir),
         "model": asdict(model.config),
         "train_examples": int(x_train.shape[0]),
         "eval_examples": int(x_eval.shape[0]),
@@ -233,9 +229,27 @@ def main() -> None:
         "delta_current_frame_probe": delta_current_metrics,
         "delta_visible_transition_probe": delta_visible_metrics,
     }
-    out_dir = args.run / "analysis"
+    out_dir = run_dir / "analysis"
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "linear_probe.json").write_text(json.dumps(output, indent=2) + "\n", encoding="utf-8")
+    return output
+
+
+def main() -> None:
+    args = parse_args()
+    if args.device == "cuda" and not torch.cuda.is_available():
+        raise SystemExit("CUDA requested but unavailable; pass --device cpu")
+    device = torch.device(args.device)
+    output = run_probe(
+        args.run,
+        device,
+        train_episodes=args.train_episodes,
+        eval_episodes=args.eval_episodes,
+        train_seed=args.train_seed,
+        eval_seed=args.eval_seed,
+        steps=args.steps,
+        lr=args.lr,
+    )
     print(json.dumps(output, indent=2))
 
 
