@@ -54,6 +54,7 @@ Latest results writeup:
 
 - `reports/notepad_long_context_run.md`
 - `reports/onnx_export_status.md`
+- `reports/notepad_final_authority_calibration.md`
 
 Run the NotePad one-episode overfit with divergence ladder logging:
 
