@@ -393,6 +393,7 @@ def hybrid_training_step(
     context_video: torch.Tensor | None = None,
     context_actions: torch.Tensor | None = None,
     context_chunk_ids: torch.Tensor | None = None,
+    changed_patch_weight: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     b = video_clean.shape[0]
     delta_clean = action_clean[..., 0:2]
@@ -429,7 +430,13 @@ def hybrid_training_step(
         context_actions,
         context_chunk_ids,
     )
-    video_loss = F.mse_loss(video_pred, video_target)
+    video_loss, video_loss_metrics = weighted_video_loss(
+        video_pred,
+        video_target,
+        video_clean,
+        context_video,
+        changed_patch_weight,
+    )
     delta_loss = F.mse_loss(delta_pred, delta_target)
     dx_loss = F.cross_entropy(dx_logits.reshape(-1, DELTA_BINS), delta_targets[..., 0].reshape(-1))
     dy_loss = F.cross_entropy(dy_logits.reshape(-1, DELTA_BINS), delta_targets[..., 1].reshape(-1))
@@ -442,6 +449,7 @@ def hybrid_training_step(
     return loss, {
         "loss": float(loss.detach()),
         "video_loss": float(video_loss.detach()),
+        **video_loss_metrics,
         "action_loss": float(action_loss.detach()),
         "delta_loss": float(delta_loss.detach()),
         "weighted_delta_loss": float((delta_weight * delta_loss).detach()),
@@ -451,6 +459,52 @@ def hybrid_training_step(
         "cursor_loss": float(cursor_loss.detach()),
         **sigma_metrics,
     }
+
+
+def weighted_video_loss(
+    video_pred: torch.Tensor,
+    video_target: torch.Tensor,
+    video_clean: torch.Tensor,
+    context_video: torch.Tensor | None,
+    changed_patch_weight: float,
+    threshold: float = 0.02,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    per_patch_loss = (video_pred - video_target).pow(2).mean(dim=-1)
+    if changed_patch_weight <= 0:
+        return per_patch_loss.mean(), {
+            "video_base_loss": float(per_patch_loss.detach().mean()),
+            "video_changed_loss": 0.0,
+            "video_unchanged_loss": float(per_patch_loss.detach().mean()),
+            "changed_patch_rate": 0.0,
+        }
+    changed = training_changed_patch_mask(video_clean, context_video, threshold)
+    weights = torch.ones_like(per_patch_loss)
+    weights = torch.where(changed, weights * changed_patch_weight, weights)
+    weighted = (per_patch_loss * weights).sum() / weights.sum().clamp_min(1.0)
+    changed_loss = per_patch_loss[changed].mean() if changed.any() else torch.zeros((), device=per_patch_loss.device)
+    unchanged = ~changed
+    unchanged_loss = per_patch_loss[unchanged].mean() if unchanged.any() else torch.zeros((), device=per_patch_loss.device)
+    return weighted, {
+        "video_base_loss": float(per_patch_loss.detach().mean()),
+        "video_changed_loss": float(changed_loss.detach()),
+        "video_unchanged_loss": float(unchanged_loss.detach()),
+        "changed_patch_rate": float(changed.float().mean()),
+    }
+
+
+def training_changed_patch_mask(
+    video_clean: torch.Tensor,
+    context_video: torch.Tensor | None,
+    threshold: float = 0.02,
+) -> torch.Tensor:
+    previous = torch.empty_like(video_clean)
+    if context_video is not None:
+        previous[:, 0] = context_video[:, -1, -1]
+    else:
+        previous[:, 0] = video_clean[:, 0]
+    previous[:, 1:] = video_clean[:, :-1]
+    patch_delta = (video_clean - previous).abs().mean(dim=-1)
+    return patch_delta > threshold
 
 
 @torch.no_grad()
@@ -549,6 +603,7 @@ def evaluate_hybrid(
     sigma_corner_low: float = 0.0,
     sigma_corner_high: float = 1.0,
     context_chunks: int = 0,
+    changed_patch_weight: float = 0.0,
     seed: int = 999,
 ) -> dict[str, float]:
     spec = load_spec()
@@ -580,6 +635,7 @@ def evaluate_hybrid(
         context_video=context_video,
         context_actions=context_actions,
         context_chunk_ids=context_chunk_ids,
+        changed_patch_weight=changed_patch_weight,
     )
     del loss
     video_noise = torch.randn(video_clean.shape, device=device, generator=generator)
@@ -649,6 +705,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--delta-weight", type=float, default=4.0)
     parser.add_argument("--delta-ce-weight", type=float, default=1.0)
     parser.add_argument("--cursor-weight", type=float, default=1.0)
+    parser.add_argument("--changed-patch-weight", type=float, default=0.0)
     parser.add_argument("--head-sigma-conditioned", action="store_true")
     parser.add_argument("--sigma-corner-weight", type=float, default=0.0)
     parser.add_argument("--sigma-corner-low", type=float, default=0.0)
@@ -731,6 +788,7 @@ def main() -> None:
                 context_video,
                 context_actions,
                 context_chunk_ids,
+                args.changed_patch_weight,
             )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -749,6 +807,7 @@ def main() -> None:
                     args.sigma_corner_low,
                     args.sigma_corner_high,
                     args.context_chunks,
+                    args.changed_patch_weight,
                 )
                 if args.ladder_every > 0 and (step == 1 or step % args.ladder_every == 0 or step == args.steps):
                     if args.context_chunks > 0:
@@ -830,6 +889,7 @@ def main() -> None:
         args.sigma_corner_low,
         args.sigma_corner_high,
         args.context_chunks,
+        args.changed_patch_weight,
     )
     if args.context_chunks > 0:
         video_all, action_all, _, chunk_ids_all, ctx_video_all, ctx_action_all, ctx_ids_all = eval_dataset.all_chunks_with_context(

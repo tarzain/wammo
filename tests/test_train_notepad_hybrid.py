@@ -6,6 +6,8 @@ from wammo.train.train_notepad_hybrid import (
     NotePadHybridChunks,
     NotePadHybridModel,
     hybrid_training_step,
+    training_changed_patch_mask,
+    weighted_video_loss,
 )
 
 
@@ -52,3 +54,18 @@ def test_hybrid_training_step_is_finite():
     loss, metrics = hybrid_training_step(model, video, actions, positions, chunk_ids, torch.Generator().manual_seed(0))
     assert torch.isfinite(loss)
     assert metrics["cursor_loss"] > 0
+
+
+def test_changed_patch_video_loss_upweights_changed_patches():
+    video = torch.zeros(1, 4, 2, 3)
+    target = torch.zeros_like(video)
+    pred = torch.zeros_like(video)
+    video[:, 1, 0] = 1
+    target[:, 1, 0] = 1
+    pred[:, 1, 0] = 3
+    mask = training_changed_patch_mask(video, context_video=None, threshold=0.02)
+    assert mask[0, 1, 0]
+    weighted, metrics = weighted_video_loss(pred, target, video, None, changed_patch_weight=10)
+    unweighted, _ = weighted_video_loss(pred, target, video, None, changed_patch_weight=0)
+    assert weighted > unweighted
+    assert metrics["changed_patch_rate"] > 0
