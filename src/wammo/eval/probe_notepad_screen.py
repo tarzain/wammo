@@ -38,7 +38,7 @@ def main() -> None:
     input_mode = checkpoint["input_mode"]
     patch_size = int(checkpoint.get("patch_size", 4))
     model = RepresentationScreenModel(config, key_count=len(load_spec()["keys"]), input_mode=input_mode, patch_size=patch_size).to(device)
-    model.load_state_dict(checkpoint["model"])
+    model.load_state_dict(checkpoint["model"], strict=False)
     model.eval()
     for parameter in model.parameters():
         parameter.requires_grad_(False)

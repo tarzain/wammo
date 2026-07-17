@@ -124,3 +124,23 @@ True-label probes:
 Read: making the cursor larger is possible, but in this diagnostic it does not solve the representation problem. The bigger finding is that mean-pooled probes were the wrong instrument for absolute position because they discard patch layout. Spatial-moment pooling is better and should replace mean pooling for future position probes, but even it does not reveal <=1 px cursor position in the current 4x4 coord model.
 
 Decision update: the current evidence no longer supports a clean "3 px within-patch floor" story. The old 3 px floor was partly a bad label/probe artifact. With exact labels, the model is much worse at absolute cursor position. Next work should focus on a position-aware architecture or probe path, not only patch size: e.g. patch-level heatmap/objectness supervision, CLS/query token cross-attention to patch tokens, or a flattened/sparse patch-token probe that preserves layout more completely than spatial moments.
+
+## CenterNet-style cursor localization screen
+
+Change: the representation screen now trains a cursor auxiliary objective as patch classification over the 24x24 grid plus within-patch offset regression. The old normalized coordinate MSE head remains available, but the screen default is now heatmap+offset, and the acceptance metric is decoded cursor position error from the model head rather than a pooled linear probe.
+
+Runs:
+
+- `runs/notepad-screen-centernet-coord`
+- `runs/notepad-screen-centernet-coord-cursor9`
+
+Both runs use 1000 generated episodes, 500 train steps, coordinate-channel patchify, `cursor_weight=0`, `cursor_heatmap_weight=1`, and `cursor_offset_weight=1`.
+
+| run | cursor size | held-out decoded MAE px | held-out decoded euclidean px | patch accuracy | best MLP probe MAE px |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `runs/notepad-screen-centernet-coord` | 5 | 19.010 | 30.033 | 0.333 | 8.907 |
+| `runs/notepad-screen-centernet-coord-cursor9` | 9 | 18.361 | 29.007 | 0.329 | 6.163 |
+
+Read: heatmap+offset learns above chance but does not clear the localization gate in this short screen. The larger cursor improves the auxiliary MLP probe substantially, so visibility matters, but it barely changes decoded localization from the model's own head. That makes "cursor is simply too small to see" an incomplete explanation. The remaining failure is likely that the trunk/head is learning coarse cursor priors and local visual cues without reliably selecting the exact patch on held-out rollouts.
+
+Decision: do not promote this configuration to the 100k run. The next diagnostic should inspect heatmap predictions directly: compare predicted patch distributions against the cursor marginal and visualize a few failure frames. If the head is following the marginal path prior, rebalance the localization loss or train a cursor-only detector on clean frames first; if it is visually tracking but shifted, audit target/render alignment again.

@@ -24,6 +24,44 @@ from wammo.train.train_notepad_binned_delta import DELTA_BINS, delta_to_bins
 from wammo.train.train_notepad_hybrid import normalize_positions
 
 
+def cursor_patch_targets(
+    positions: torch.Tensor,
+    patch_size: int,
+    width: int = 96,
+    height: int = 96,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert normalized cursor positions to patch class plus within-patch offset."""
+    grid_w = width // patch_size
+    grid_h = height // patch_size
+    x = positions[..., 0].clamp(0, 1) * (width - 1)
+    y = positions[..., 1].clamp(0, 1) * (height - 1)
+    patch_x = torch.floor(x / patch_size).long().clamp(0, grid_w - 1)
+    patch_y = torch.floor(y / patch_size).long().clamp(0, grid_h - 1)
+    patch_index = patch_y * grid_w + patch_x
+    offset_x = ((x - patch_x.to(x.dtype) * patch_size) / patch_size).clamp(0, 1)
+    offset_y = ((y - patch_y.to(y.dtype) * patch_size) / patch_size).clamp(0, 1)
+    return patch_index, torch.stack([offset_x, offset_y], dim=-1)
+
+
+def decode_cursor_heatmap(
+    patch_logits: torch.Tensor,
+    patch_offsets: torch.Tensor,
+    patch_size: int,
+    width: int = 96,
+    height: int = 96,
+) -> torch.Tensor:
+    """Decode CenterNet-style patch logits and offsets to normalized cursor positions."""
+    grid_w = width // patch_size
+    patch_index = patch_logits.argmax(dim=-1)
+    patch_x = patch_index.remainder(grid_w).to(patch_offsets.dtype)
+    patch_y = torch.div(patch_index, grid_w, rounding_mode="floor").to(patch_offsets.dtype)
+    gather_index = patch_index.unsqueeze(-1).unsqueeze(-1).expand(*patch_index.shape, 1, 2)
+    offset = patch_offsets.gather(2, gather_index).squeeze(2).clamp(0, 1)
+    x = (patch_x + offset[..., 0]) * patch_size
+    y = (patch_y + offset[..., 1]) * patch_size
+    return torch.stack([x.clamp(0, width - 1) / (width - 1), y.clamp(0, height - 1) / (height - 1)], dim=-1)
+
+
 class RepresentationScreenDataset:
     def __init__(
         self,
@@ -134,6 +172,8 @@ class RepresentationScreenModel(nn.Module):
         self.button_out = nn.Linear(config.d_model, 2)
         self.key_out = nn.Linear(config.d_model, key_count)
         self.cursor_out = nn.Linear(config.d_model, 2)
+        self.cursor_patch_out = nn.Linear(config.d_model, 1)
+        self.cursor_offset_out = nn.Linear(config.d_model, 2)
         self.video_pos = nn.Parameter(torch.zeros(1, config.chunk_frames * config.patches_per_frame, config.d_model))
         self.action_pos = nn.Parameter(torch.zeros(1, config.chunk_frames, config.d_model))
         self.chunk_pos = nn.Embedding(config.max_chunks, config.d_model)
@@ -198,7 +238,17 @@ class RepresentationScreenModel(nn.Module):
         sigma_video: torch.Tensor,
         sigma_action: torch.Tensor,
         chunk_ids: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         video_hidden, action_hidden, _ = self.encode(
             frames, delta_actions, button_ids, key_ids, sigma_video, sigma_action, chunk_ids
         )
@@ -211,6 +261,8 @@ class RepresentationScreenModel(nn.Module):
             self.button_out(action_hidden),
             self.key_out(action_hidden),
             self.cursor_out(frame_hidden).sigmoid(),
+            self.cursor_patch_out(video_hidden).squeeze(-1),
+            self.cursor_offset_out(video_hidden).sigmoid(),
         )
 
 
@@ -224,6 +276,8 @@ def screen_training_step(
     delta_weight: float,
     delta_ce_weight: float,
     cursor_weight: float,
+    cursor_heatmap_weight: float = 0.0,
+    cursor_offset_weight: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     b = video_clean.shape[0]
     delta_clean = action_clean[..., 0:2]
@@ -238,9 +292,17 @@ def screen_training_step(
     delta_noisy = interpolate(delta_clean, delta_noise, t_action)
     video_target = velocity_target(patchify(video_clean, patch_size=model.patch_size), patchify(video_noise, patch_size=model.patch_size))
     delta_target = velocity_target(delta_clean, delta_noise)
-    video_pred, delta_pred, dx_logits, dy_logits, button_logits, key_logits, cursor_pred = model.forward_all(
-        video_noisy, delta_noisy, button_target, key_target, t_video, t_action, chunk_ids
-    )
+    (
+        video_pred,
+        delta_pred,
+        dx_logits,
+        dy_logits,
+        button_logits,
+        key_logits,
+        cursor_pred,
+        cursor_patch_logits,
+        cursor_offsets,
+    ) = model.forward_all(video_noisy, delta_noisy, button_target, key_target, t_video, t_action, chunk_ids)
     video_loss = F.mse_loss(video_pred, video_target)
     delta_loss = F.mse_loss(delta_pred, delta_target)
     delta_ce_loss = 0.5 * (
@@ -250,13 +312,37 @@ def screen_training_step(
     button_loss = F.cross_entropy(button_logits.reshape(-1, 2), button_target.reshape(-1))
     key_loss = F.cross_entropy(key_logits.reshape(-1, model.key_count), key_target.reshape(-1))
     cursor_loss = F.mse_loss(cursor_pred, position_clean)
-    loss = video_loss + delta_weight * delta_loss + delta_ce_weight * delta_ce_loss + button_loss + key_loss + cursor_weight * cursor_loss
+    cursor_patch_target, cursor_offset_target = cursor_patch_targets(position_clean, model.patch_size)
+    cursor_heatmap_loss = F.cross_entropy(
+        cursor_patch_logits.reshape(-1, model.config.patches_per_frame),
+        cursor_patch_target.reshape(-1),
+    )
+    gather_index = cursor_patch_target.unsqueeze(-1).unsqueeze(-1).expand(*cursor_patch_target.shape, 1, 2)
+    cursor_offset_pred = cursor_offsets.gather(2, gather_index).squeeze(2)
+    cursor_offset_loss = F.smooth_l1_loss(cursor_offset_pred, cursor_offset_target)
+    cursor_decoded = decode_cursor_heatmap(cursor_patch_logits, cursor_offsets, model.patch_size)
+    cursor_decoded_mae_px = torch.mean(
+        torch.abs((cursor_decoded - position_clean) * torch.tensor([95.0, 95.0], device=position_clean.device))
+    )
+    loss = (
+        video_loss
+        + delta_weight * delta_loss
+        + delta_ce_weight * delta_ce_loss
+        + button_loss
+        + key_loss
+        + cursor_weight * cursor_loss
+        + cursor_heatmap_weight * cursor_heatmap_loss
+        + cursor_offset_weight * cursor_offset_loss
+    )
     return loss, {
         "loss": float(loss.detach()),
         "video_loss": float(video_loss.detach()),
         "delta_loss": float(delta_loss.detach()),
         "delta_ce_loss": float(delta_ce_loss.detach()),
         "cursor_loss": float(cursor_loss.detach()),
+        "cursor_heatmap_loss": float(cursor_heatmap_loss.detach()),
+        "cursor_offset_loss": float(cursor_offset_loss.detach()),
+        "cursor_decoded_mae_px": float(cursor_decoded_mae_px.detach()),
         "button_loss": float(button_loss.detach()),
         "key_loss": float(key_loss.detach()),
     }
@@ -353,6 +439,51 @@ def probe_screen_model(
     return {"pooling": pooling, "best_layer": best, "best_mlp_layer": best_mlp, "layer_sweep": layer_results}
 
 
+@torch.no_grad()
+def evaluate_cursor_decoder(
+    model: RepresentationScreenModel,
+    dataset: RepresentationScreenDataset,
+    device: torch.device,
+    batch_chunks: int = 64,
+) -> dict[str, float]:
+    video_all, actions_all, positions_all, chunk_ids_all = dataset.all_chunks(torch.device("cpu"))
+    total_abs = 0.0
+    total_euclidean = 0.0
+    total_frames = 0
+    patch_correct = 0
+    total_patches = 0
+    for start in range(0, video_all.shape[0], batch_chunks):
+        end = start + batch_chunks
+        video = video_all[start:end].to(device)
+        actions = actions_all[start:end].to(device)
+        positions = positions_all[start:end].to(device)
+        chunk_ids = chunk_ids_all[start:end].to(device)
+        b = video.shape[0]
+        _, _, _, _, _, _, _, patch_logits, offsets = model.forward_all(
+            video,
+            actions[..., 0:2],
+            actions[..., 2].long(),
+            actions[..., 3].long(),
+            torch.zeros((b,), device=device),
+            torch.zeros((b,), device=device),
+            chunk_ids,
+        )
+        decoded = decode_cursor_heatmap(patch_logits, offsets, model.patch_size)
+        scale = torch.tensor([dataset.width - 1, dataset.height - 1], device=device, dtype=decoded.dtype)
+        diff_px = (decoded - positions).abs() * scale
+        total_abs += float(diff_px.sum())
+        total_euclidean += float(torch.linalg.vector_norm((decoded - positions) * scale, dim=-1).sum())
+        total_frames += int(decoded.numel() // 2)
+        target_patch, _ = cursor_patch_targets(positions, model.patch_size, dataset.width, dataset.height)
+        patch_correct += int((patch_logits.argmax(dim=-1) == target_patch).sum())
+        total_patches += int(target_patch.numel())
+    return {
+        "decoded_mae_px": total_abs / (total_frames * 2),
+        "decoded_euclidean_px": total_euclidean / total_frames,
+        "patch_accuracy": patch_correct / total_patches,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input-mode", choices=["linear", "coord", "conv"], required=True)
@@ -370,7 +501,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-heads", type=int, default=4)
     parser.add_argument("--delta-weight", type=float, default=4.0)
     parser.add_argument("--delta-ce-weight", type=float, default=1.0)
-    parser.add_argument("--cursor-weight", type=float, default=1.0)
+    parser.add_argument("--cursor-weight", type=float, default=0.0)
+    parser.add_argument("--cursor-heatmap-weight", type=float, default=1.0)
+    parser.add_argument("--cursor-offset-weight", type=float, default=1.0)
     parser.add_argument("--probe-steps", type=int, default=1000)
     parser.add_argument("--probe-batch-chunks", type=int, default=64)
     parser.add_argument("--mlp-hidden", type=int, default=256)
@@ -385,6 +518,8 @@ def main() -> None:
     args = parse_args()
     if args.device == "cuda" and not torch.cuda.is_available():
         raise SystemExit("CUDA requested but torch.cuda.is_available() is false; pass --device cpu to run on CPU")
+    if args.input_mode == "conv" and args.patch_size != 4:
+        raise SystemExit("conv input mode currently emits a 24x24 grid; use --patch-size 4")
     device = torch.device(args.device)
     torch.manual_seed(args.seed)
     sample_generator = torch.Generator().manual_seed(args.seed)
@@ -431,6 +566,8 @@ def main() -> None:
                 args.delta_weight,
                 args.delta_ce_weight,
                 args.cursor_weight,
+                args.cursor_heatmap_weight,
+                args.cursor_offset_weight,
             )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -443,7 +580,9 @@ def main() -> None:
                 f.flush()
                 print(
                     f"step={step} loss={row['loss']:.4f} video={row['video_loss']:.4f} "
-                    f"delta={row['delta_loss']:.4f} delta_ce={row['delta_ce_loss']:.4f} cursor={row['cursor_loss']:.4f}"
+                    f"delta={row['delta_loss']:.4f} delta_ce={row['delta_ce_loss']:.4f} "
+                    f"cursor_ce={row['cursor_heatmap_loss']:.4f} cursor_off={row['cursor_offset_loss']:.4f} "
+                    f"cursor_decoded_mae_px={row['cursor_decoded_mae_px']:.3f}"
                 )
     torch.save(
         {"model": model.state_dict(), "config": asdict(config), "input_mode": args.input_mode, "patch_size": args.patch_size},
@@ -460,6 +599,12 @@ def main() -> None:
         batch_chunks=args.probe_batch_chunks,
         pooling=args.pooling,
     )
+    cursor_decoder_eval = evaluate_cursor_decoder(
+        model,
+        eval_dataset,
+        device,
+        batch_chunks=args.probe_batch_chunks,
+    )
     output = {
         "model_kind": "notepad_representation_screen",
         "input_mode": args.input_mode,
@@ -468,6 +613,7 @@ def main() -> None:
         "train_dataset": train_metadata,
         "eval_dataset": eval_metadata,
         "first_metrics": first_metrics,
+        "cursor_decoder_eval": cursor_decoder_eval,
         "final_probe": probe,
     }
     (args.out / "summary.json").write_text(json.dumps(output, indent=2) + "\n", encoding="utf-8")
