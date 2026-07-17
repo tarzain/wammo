@@ -24,6 +24,7 @@ from wammo.train.overfit_notepad_one import (
     write_contact_sheet,
 )
 from wammo.train.overfit_one import normalize_frames
+from wammo.train.train_notepad_pure_inverse import augment_frames
 from wammo.train.train_notepad import generate_training_dataset, make_eval_dataset
 from wammo.train.train_notepad_binned_delta import DELTA_BINS, bins_to_delta_norm, delta_to_bins
 
@@ -43,9 +44,17 @@ def denormalize_positions(positions: torch.Tensor, width: int, height: int) -> t
 
 
 class NotePadHybridModel(NotePadJointModel):
-    def __init__(self, config: MicroWAMConfig, key_count: int, head_sigma_conditioned: bool = False):
+    def __init__(
+        self,
+        config: MicroWAMConfig,
+        key_count: int,
+        head_sigma_conditioned: bool = False,
+        video_output_dim: int = 4 * 4 * 3,
+    ):
         super().__init__(config, key_count)
         self.head_sigma_conditioned = head_sigma_conditioned
+        self.video_output_dim = video_output_dim
+        self.video_out = nn.Linear(config.d_model, video_output_dim)
         self.dx_out = nn.Linear(config.d_model, DELTA_BINS)
         self.dy_out = nn.Linear(config.d_model, DELTA_BINS)
         self.cursor_out = nn.Linear(config.d_model, 2)
@@ -98,6 +107,38 @@ class NotePadHybridModel(NotePadJointModel):
             self.key_out(action_hidden),
             self.cursor_out(frame_hidden).sigmoid(),
         )
+
+    def encode_hidden(
+        self,
+        video_patches: torch.Tensor,
+        delta_actions: torch.Tensor,
+        button_ids: torch.Tensor,
+        key_ids: torch.Tensor,
+        sigma_video: torch.Tensor,
+        sigma_action: torch.Tensor,
+        chunk_ids: torch.Tensor,
+        action_drop: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        b, c, p, d = video_patches.shape
+        if (c, p, d) != (self.config.chunk_frames, self.config.patches_per_frame, self.config.patch_dim):
+            raise ValueError(f"unexpected video patch shape {tuple(video_patches.shape)}")
+        if action_drop is not None:
+            button_ids = torch.where(action_drop.squeeze(-1), torch.full_like(button_ids, 2), button_ids)
+            key_ids = torch.where(action_drop.squeeze(-1), torch.full_like(key_ids, self.key_count), key_ids)
+            delta_actions = torch.where(action_drop, torch.zeros_like(delta_actions), delta_actions)
+        chunk_tokens = self.chunk_pos(chunk_ids).unsqueeze(1)
+        video_tokens = self.video_in(video_patches).reshape(b, c * p, self.config.d_model)
+        action_tokens = self.delta_in(delta_actions) + self.button_in(button_ids) + self.key_in(key_ids)
+        video_tokens = video_tokens + self.video_pos + chunk_tokens + self.video_sigma(sigma_video.reshape(b, 1)).unsqueeze(1)
+        action_tokens = action_tokens + self.action_pos + chunk_tokens + self.action_sigma(sigma_action.reshape(b, 1)).unsqueeze(1)
+        hidden = self.backbone(torch.cat([video_tokens, action_tokens], dim=1))
+        video_hidden = hidden[:, : c * p].reshape(b, c, p, self.config.d_model)
+        action_hidden = hidden[:, c * p :]
+        return video_hidden, action_hidden
+
+
+def hybrid_video_patches(frames: torch.Tensor, input_mode: str, patch_size: int = 4) -> torch.Tensor:
+    return patchify(augment_frames(frames, input_mode), patch_size=patch_size)
 
 
 def sample_sigma_pair(

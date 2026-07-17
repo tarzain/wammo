@@ -214,3 +214,28 @@ Both runs use 1000 episodes, 3000 steps, batch size 4, 4x4 patches, and the same
 Read: the pure inverse arm cleanly beats the noisy-action hybrid metric, so video-grounded inverse dynamics is learnable once the action-token shortcut is removed. More importantly, frame-difference channels are a large win: they cut motion MAE by another `2.05 px` and bring predicted motion magnitude close to the true scale. This means the representation ceiling is not simply "absolute cursor position is too coarse"; delta needs relative motion information, and explicit frame differences make that information linearly/local-token visible enough for the small transformer.
 
 Decision update: promote frame-difference channels into the next joint/hybrid run before paying for 2x2 patches. The next candidate should combine the useful infrastructure: coord+diff video input, continuous in-stream deltas, σ-conditioned heads, corner-weighted σ sampling, and a pure-inverse auxiliary loss where the CE dx/dy head sees masked/noisy action tokens. If that preserves ladder authority while keeping noisy-action inverse MAE near the `1.86 px` pure-inverse result, it becomes the first serious 100k candidate.
+
+## Coord+diff hybrid synthesis arm
+
+Run: `runs/notepad-1k-hybrid-coord-diff-inverse`
+
+Change: fold the pure-inverse result back into the hybrid model. The encoder sees coord+frame-difference patches while the video head still predicts RGB patch velocity only. Main joint training uses diff channels computed from noised RGB latents; the pure-inverse auxiliary loss uses clean coord+diff video, fully noisy delta tokens, and masks the first frame in each chunk. The model also keeps σ-conditioned heads and the 50% corner-weighted σ sampler.
+
+Final 1k metrics:
+
+| metric | value |
+| --- | ---: |
+| inverse aux motion MAE px | 2.711 |
+| inverse aux pred abs mean px | 5.246 |
+| motion zero baseline px | 5.252 |
+| flow delta MAE px | 4.055 |
+| CE delta MAE px | 4.338 |
+| cursor pos MAE px | 17.183 |
+| click / key / key-event acc | 1.000 / 1.000 / 1.000 |
+| cursor h4 ladder | 1.445e-4 |
+| click h4 ladder | 1.126e-5 |
+| key h4 ladder | 1.759e-5 |
+
+Read: the inverse auxiliary path partially transfers the frame-difference win into the joint model: `2.711 px` is much better than the prior noisy-action inverse numbers (`4.5-4.8 px`) and keeps the true motion scale. But it does not preserve generation authority. Cursor h4 ladder collapses by more than an order of magnitude relative to the delta-weight gate (`1.76e-3`) and the previous corner hybrid (`1.87e-3`). This arm improves recognition/inverse dynamics while damaging the action-conditioned video pathway.
+
+Decision: do not launch 100k from this synthesis. The integration point is wrong. Keep the pure-inverse coord+diff result as a strong auxiliary/detector module, but avoid feeding raw noised intra-chunk diffs into the generation encoder. The next integration should separate pathways: RGB/noisy latents for generation authority, plus a clean or denoised-estimate diff pathway only for inverse/action heads, with gradients balanced so the inverse head cannot overwrite the shared video-action binding.
