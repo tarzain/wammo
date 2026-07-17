@@ -356,31 +356,36 @@ def extract_screen_layer_features(
     batch_chunks: int = 64,
     pooling: str = "spatial",
 ) -> tuple[list[torch.Tensor], torch.Tensor, torch.Tensor]:
+    was_training = model.training
+    model.eval()
     video_all, actions_all, _, chunk_ids_all = dataset.all_chunks(torch.device("cpu"))
     layer_parts: list[list[torch.Tensor]] | None = None
-    for start in range(0, video_all.shape[0], batch_chunks):
-        end = start + batch_chunks
-        video = video_all[start:end].to(device)
-        actions = actions_all[start:end].to(device)
-        chunk_ids = chunk_ids_all[start:end].to(device)
-        zero_actions = torch.zeros_like(actions)
-        video_hidden, _, layers = model.encode(
-            video,
-            zero_actions[..., 0:2],
-            zero_actions[..., 2].long(),
-            zero_actions[..., 3].long(),
-            torch.zeros((video.shape[0],), device=device),
-            torch.zeros((video.shape[0],), device=device),
-            chunk_ids,
-            return_layers=True,
-        )
-        if not layers:
-            layers = [video_hidden]
-        if layer_parts is None:
-            layer_parts = [[] for _ in layers]
-        for layer_index, layer in enumerate(layers):
-            features = frame_features_from_hidden(layer, pooling=pooling)
-            layer_parts[layer_index].append(features.cpu().reshape(-1, features.shape[-1]))
+    try:
+        for start in range(0, video_all.shape[0], batch_chunks):
+            end = start + batch_chunks
+            video = video_all[start:end].to(device)
+            actions = actions_all[start:end].to(device)
+            chunk_ids = chunk_ids_all[start:end].to(device)
+            zero_actions = torch.zeros_like(actions)
+            video_hidden, _, layers = model.encode(
+                video,
+                zero_actions[..., 0:2],
+                zero_actions[..., 2].long(),
+                zero_actions[..., 3].long(),
+                torch.zeros((video.shape[0],), device=device),
+                torch.zeros((video.shape[0],), device=device),
+                chunk_ids,
+                return_layers=True,
+            )
+            if not layers:
+                layers = [video_hidden]
+            if layer_parts is None:
+                layer_parts = [[] for _ in layers]
+            for layer_index, layer in enumerate(layers):
+                features = frame_features_from_hidden(layer, pooling=pooling)
+                layer_parts[layer_index].append(features.cpu().reshape(-1, features.shape[-1]))
+    finally:
+        model.train(was_training)
     if layer_parts is None:
         raise ValueError("no chunks available for screen probe")
     positions_out = dataset.positions.reshape(-1, 2)
@@ -446,42 +451,47 @@ def evaluate_cursor_decoder(
     device: torch.device,
     batch_chunks: int = 64,
 ) -> dict[str, float]:
+    was_training = model.training
+    model.eval()
     video_all, actions_all, positions_all, chunk_ids_all = dataset.all_chunks(torch.device("cpu"))
     total_abs = 0.0
     total_euclidean = 0.0
     total_frames = 0
     patch_correct = 0
     total_patches = 0
-    for start in range(0, video_all.shape[0], batch_chunks):
-        end = start + batch_chunks
-        video = video_all[start:end].to(device)
-        actions = actions_all[start:end].to(device)
-        positions = positions_all[start:end].to(device)
-        chunk_ids = chunk_ids_all[start:end].to(device)
-        b = video.shape[0]
-        _, _, _, _, _, _, _, patch_logits, offsets = model.forward_all(
-            video,
-            actions[..., 0:2],
-            actions[..., 2].long(),
-            actions[..., 3].long(),
-            torch.zeros((b,), device=device),
-            torch.zeros((b,), device=device),
-            chunk_ids,
-        )
-        decoded = decode_cursor_heatmap(patch_logits, offsets, model.patch_size)
-        scale = torch.tensor([dataset.width - 1, dataset.height - 1], device=device, dtype=decoded.dtype)
-        diff_px = (decoded - positions).abs() * scale
-        total_abs += float(diff_px.sum())
-        total_euclidean += float(torch.linalg.vector_norm((decoded - positions) * scale, dim=-1).sum())
-        total_frames += int(decoded.numel() // 2)
-        target_patch, _ = cursor_patch_targets(positions, model.patch_size, dataset.width, dataset.height)
-        patch_correct += int((patch_logits.argmax(dim=-1) == target_patch).sum())
-        total_patches += int(target_patch.numel())
-    return {
-        "decoded_mae_px": total_abs / (total_frames * 2),
-        "decoded_euclidean_px": total_euclidean / total_frames,
-        "patch_accuracy": patch_correct / total_patches,
-    }
+    try:
+        for start in range(0, video_all.shape[0], batch_chunks):
+            end = start + batch_chunks
+            video = video_all[start:end].to(device)
+            actions = actions_all[start:end].to(device)
+            positions = positions_all[start:end].to(device)
+            chunk_ids = chunk_ids_all[start:end].to(device)
+            b = video.shape[0]
+            _, _, _, _, _, _, _, patch_logits, offsets = model.forward_all(
+                video,
+                actions[..., 0:2],
+                actions[..., 2].long(),
+                actions[..., 3].long(),
+                torch.zeros((b,), device=device),
+                torch.zeros((b,), device=device),
+                chunk_ids,
+            )
+            decoded = decode_cursor_heatmap(patch_logits, offsets, model.patch_size)
+            scale = torch.tensor([dataset.width - 1, dataset.height - 1], device=device, dtype=decoded.dtype)
+            diff_px = (decoded - positions).abs() * scale
+            total_abs += float(diff_px.sum())
+            total_euclidean += float(torch.linalg.vector_norm((decoded - positions) * scale, dim=-1).sum())
+            total_frames += int(decoded.numel() // 2)
+            target_patch, _ = cursor_patch_targets(positions, model.patch_size, dataset.width, dataset.height)
+            patch_correct += int((patch_logits.argmax(dim=-1) == target_patch).sum())
+            total_patches += int(target_patch.numel())
+        return {
+            "decoded_mae_px": total_abs / (total_frames * 2),
+            "decoded_euclidean_px": total_euclidean / total_frames,
+            "patch_accuracy": patch_correct / total_patches,
+        }
+    finally:
+        model.train(was_training)
 
 
 def parse_args() -> argparse.Namespace:
@@ -588,6 +598,7 @@ def main() -> None:
         {"model": model.state_dict(), "config": asdict(config), "input_mode": args.input_mode, "patch_size": args.patch_size},
         args.out / "checkpoint.pt",
     )
+    model.eval()
     probe = probe_screen_model(
         model,
         train_dataset,

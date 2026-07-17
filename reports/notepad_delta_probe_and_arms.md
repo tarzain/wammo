@@ -139,8 +139,36 @@ Both runs use 1000 generated episodes, 500 train steps, coordinate-channel patch
 | run | cursor size | held-out decoded MAE px | held-out decoded euclidean px | patch accuracy | best MLP probe MAE px |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | `runs/notepad-screen-centernet-coord` | 5 | 19.010 | 30.033 | 0.333 | 8.907 |
-| `runs/notepad-screen-centernet-coord-cursor9` | 9 | 18.361 | 29.007 | 0.329 | 6.163 |
+| `runs/notepad-screen-centernet-coord-cursor9` | 9 | 19.017 | 30.041 | 0.332 | 6.163 |
 
 Read: heatmap+offset learns above chance but does not clear the localization gate in this short screen. The larger cursor improves the auxiliary MLP probe substantially, so visibility matters, but it barely changes decoded localization from the model's own head. That makes "cursor is simply too small to see" an incomplete explanation. The remaining failure is likely that the trunk/head is learning coarse cursor priors and local visual cues without reliably selecting the exact patch on held-out rollouts.
 
 Decision: do not promote this configuration to the 100k run. The next diagnostic should inspect heatmap predictions directly: compare predicted patch distributions against the cursor marginal and visualize a few failure frames. If the head is following the marginal path prior, rebalance the localization loss or train a cursor-only detector on clean frames first; if it is visually tracking but shifted, audit target/render alignment again.
+
+Note: the original saved larger-cursor decoder metric was produced from an in-process trainer path that had not switched the transformer back to eval mode after training/probing. Recomputing the checkpoint with `model.eval()` gives the corrected row above. The screen probe and decoder helpers now set and restore eval mode explicitly.
+
+## Sigma stratification
+
+Runs:
+
+- `runs/notepad-screen-centernet-coord/analysis/sigma_stratification.json`
+- `runs/notepad-screen-centernet-coord-cursor9/analysis/sigma_stratification.json`
+
+Question: are the cursor aux head and delta inverse heads failing because they read noised current-chunk tokens at high flow σ?
+
+Default cursor-size checkpoint:
+
+| slice | σ=0 | σ=0.5 | σ=1.0 |
+| --- | ---: | ---: | ---: |
+| cursor decoded MAE, video σ varied, clean action | 19.010 | 19.742 | 20.684 |
+| cursor patch acc, video σ varied, clean action | 0.333 | 0.270 | 0.063 |
+| CE delta motion MAE, action σ varied, clean video | 1.987 | 3.493 | 5.136 |
+| CE delta motion MAE, video σ varied, noisy action | 5.136 | 5.138 | 5.256 |
+| flow delta motion MAE, action σ varied, clean video | 7.522 | 6.584 | 5.216 |
+| flow delta motion MAE, video σ varied, noisy action | 5.216 | 5.223 | 5.248 |
+
+The larger-cursor checkpoint has the same qualitative curves: cursor localization is already poor at σ=0 and worsens with video σ; delta CE is strong only when the action token itself is near-clean, and becomes baseline-like when action σ approaches 1; video σ barely changes delta inverse performance when action tokens are fully noisy.
+
+Read: the cleanest version of the hypothesis is not confirmed. The cursor head is not secretly near-ceiling at low σ; it is already bad on clean video. But the sigma cut does explain part of the delta story: the CE inverse head mostly exploits low-noise action-token self-information, not video-derived inverse dynamics. When action tokens are fully noisy, clean video does not rescue delta prediction. That is a more specific failure than "video noising erases the cursor": the current action-prediction path is not forced to compute displacement from video.
+
+Decision update: the next intervention should not be another cursor-size or patch-size screen. First inspect heatmap predictions and delta CE predictions against marginals, then test a stricter inverse-dynamics setup where action tokens are masked/noised while video is clean and the head must read frame-to-frame displacement. The result also strengthens the case for decoupled σ schedules or explicit low-σ/action-mask training for action prediction, but only after confirming the heads are not simply learning marginal priors.
