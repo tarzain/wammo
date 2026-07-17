@@ -53,6 +53,7 @@ The NotePad Desk v2 path uses mixed-objective joint modeling: video patches and 
 Latest results writeup:
 
 - `reports/notepad_long_context_run.md`
+- `reports/onnx_export_status.md`
 
 Run the NotePad one-episode overfit with divergence ladder logging:
 
