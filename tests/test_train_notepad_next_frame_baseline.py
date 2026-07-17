@@ -7,6 +7,7 @@ from wammo.train.train_notepad_next_frame_baseline import (
     NotePadNextFrameCNN,
     action_to_planes,
     baseline_step,
+    rollout_training_step,
 )
 
 
@@ -63,3 +64,36 @@ def test_residual_baseline_starts_as_copy_model():
     pred = model(frames, actions)
 
     assert torch.allclose(pred, frames)
+
+
+def test_rollout_sampler_aligns_actions_and_targets():
+    frames = np.zeros((1, 5, 96, 96, 3), dtype=np.uint8)
+    for t in range(5):
+        frames[0, t, :, :] = t * 10
+    actions = np.zeros((1, 5, 4), dtype=np.float32)
+    for t in range(5):
+        actions[0, t, 0] = t
+    dataset = NotePadFramePairs(frames, actions, motion_oversample=False)
+
+    inputs, action_chunks, targets = dataset.sample_rollout(1, 2, torch.Generator().manual_seed(0), torch.device("cpu"))
+
+    assert inputs.shape == (1, 3, 96, 96)
+    assert action_chunks.shape == (1, 2, 4)
+    assert targets.shape == (1, 2, 3, 96, 96)
+    start_value = round(float((inputs[0, 0, 0, 0] + 1) * 127.5 / 10))
+    assert action_chunks[0, 0, 0].item() == (start_value + 1) / 8
+    expected_target = ((start_value + 1) * 10) / 127.5 - 1
+    assert torch.allclose(targets[0, 0], torch.full_like(targets[0, 0], expected_target))
+
+
+def test_rollout_training_step_is_finite():
+    model = NotePadNextFrameCNN(NextFrameBaselineConfig(hidden_channels=16, blocks=1, key_count=18, predict_residual=True))
+    input_frame = torch.zeros(2, 3, 96, 96)
+    targets = torch.zeros(2, 3, 3, 96, 96)
+    targets[:, :, :, 10:14, 10:14] = 1
+    actions = torch.zeros(2, 3, 4)
+
+    loss, metrics = rollout_training_step(model, input_frame, actions, targets, changed_weight=10)
+
+    assert torch.isfinite(loss)
+    assert metrics["changed_pixel_rate"] > 0

@@ -99,6 +99,31 @@ class NotePadFramePairs:
         actions = self.actions[selected[:, 0], selected[:, 1]]
         return frames_to_bchw(input_frames).to(device), normalize_actions(actions, self.max_delta).to(device), frames_to_bchw(target_frames).to(device)
 
+    def sample_rollout(
+        self,
+        batch_size: int,
+        rollout_steps: int,
+        generator: torch.Generator,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if rollout_steps < 1:
+            raise ValueError("rollout_steps must be >= 1")
+        max_start = self.frames.shape[1] - rollout_steps - 1
+        if max_start < 0:
+            raise ValueError(f"rollout_steps={rollout_steps} exceeds episode length {self.frames.shape[1]}")
+        episode_idx = torch.randint(self.frames.shape[0], (batch_size,), generator=generator).numpy()
+        start_idx = torch.randint(max_start + 1, (batch_size,), generator=generator).numpy()
+        input_frames, target_frames, action_chunks = [], [], []
+        for ep, start in zip(episode_idx, start_idx, strict=True):
+            input_frames.append(self.frames[int(ep), int(start)])
+            target_frames.append(self.frames[int(ep), int(start) + 1 : int(start) + 1 + rollout_steps])
+            action_chunks.append(self.actions[int(ep), int(start) + 1 : int(start) + 1 + rollout_steps])
+        return (
+            frames_to_bchw(np.stack(input_frames)).to(device),
+            normalize_actions(np.stack(action_chunks), self.max_delta).to(device),
+            rollout_frames_to_btchw(np.stack(target_frames)).to(device),
+        )
+
     def all_pairs(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         input_frames = self.frames[self.pairs[:, 0], self.pairs[:, 1] - 1]
         target_frames = self.frames[self.pairs[:, 0], self.pairs[:, 1]]
@@ -121,6 +146,11 @@ class NotePadFramePairs:
 
 def frames_to_bchw(frames: np.ndarray) -> torch.Tensor:
     return normalize_frames(frames).permute(0, 3, 1, 2).contiguous()
+
+
+def rollout_frames_to_btchw(frames: np.ndarray) -> torch.Tensor:
+    tensor = normalize_frames(frames)
+    return tensor.permute(0, 1, 4, 2, 3).contiguous()
 
 
 def bchw_to_thwc(frames: torch.Tensor) -> torch.Tensor:
@@ -159,6 +189,64 @@ def baseline_step(
     changed_weight: float,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     pred = model(input_frame, action)
+    per_pixel = (pred - target_frame).abs().mean(dim=1, keepdim=True)
+    weights = changed_pixel_weight(input_frame, target_frame, changed_weight)
+    loss = (per_pixel * weights).sum() / weights.sum().clamp_min(1.0)
+    changed = weights > 1
+    changed_loss = per_pixel[changed].mean() if bool(changed.any()) else torch.zeros((), device=target_frame.device)
+    unchanged_loss = per_pixel[~changed].mean() if bool((~changed).any()) else torch.zeros((), device=target_frame.device)
+    return loss, {
+        "loss": float(loss.detach()),
+        "mae": float(per_pixel.detach().mean()),
+        "changed_mae": float(changed_loss.detach()),
+        "unchanged_mae": float(unchanged_loss.detach()),
+        "changed_pixel_rate": float(changed.float().mean()),
+    }
+
+
+def rollout_training_step(
+    model: NotePadNextFrameCNN,
+    input_frame: torch.Tensor,
+    actions: torch.Tensor,
+    target_frames: torch.Tensor,
+    changed_weight: float,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    if actions.ndim != 3:
+        raise ValueError(f"expected BTA actions, got {tuple(actions.shape)}")
+    if target_frames.ndim != 5:
+        raise ValueError(f"expected BTCHW targets, got {tuple(target_frames.shape)}")
+    current = input_frame
+    losses = []
+    maes = []
+    changed_maes = []
+    unchanged_maes = []
+    changed_rates = []
+    for step in range(actions.shape[1]):
+        target = target_frames[:, step]
+        pred = model(current, actions[:, step])
+        loss, metrics = baseline_step_identity(pred, current, target, changed_weight)
+        losses.append(loss)
+        maes.append(metrics["mae"])
+        changed_maes.append(metrics["changed_mae"])
+        unchanged_maes.append(metrics["unchanged_mae"])
+        changed_rates.append(metrics["changed_pixel_rate"])
+        current = pred
+    total = torch.stack(losses).mean()
+    return total, {
+        "loss": float(total.detach()),
+        "mae": float(np.mean(maes)),
+        "changed_mae": float(np.mean(changed_maes)),
+        "unchanged_mae": float(np.mean(unchanged_maes)),
+        "changed_pixel_rate": float(np.mean(changed_rates)),
+    }
+
+
+def baseline_step_identity(
+    pred: torch.Tensor,
+    input_frame: torch.Tensor,
+    target_frame: torch.Tensor,
+    changed_weight: float,
+) -> tuple[torch.Tensor, dict[str, float]]:
     per_pixel = (pred - target_frame).abs().mean(dim=1, keepdim=True)
     weights = changed_pixel_weight(input_frame, target_frame, changed_weight)
     loss = (per_pixel * weights).sum() / weights.sum().clamp_min(1.0)
@@ -336,6 +424,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--blocks", type=int, default=4)
     parser.add_argument("--predict-residual", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--changed-pixel-weight", type=float, default=64.0)
+    parser.add_argument("--rollout-steps", type=int, default=1)
     parser.add_argument("--motion-oversample", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--generate-progress-every", type=int, default=100)
     return parser.parse_args()
@@ -382,9 +471,15 @@ def main() -> None:
     with metrics_path.open("w", encoding="utf-8") as f:
         for step in range(1, args.steps + 1):
             model.train()
-            inputs, actions, targets = train_dataset.sample(args.batch_size, sample_generator, device)
+            if args.rollout_steps > 1:
+                inputs, actions, targets = train_dataset.sample_rollout(args.batch_size, args.rollout_steps, sample_generator, device)
+            else:
+                inputs, actions, targets = train_dataset.sample(args.batch_size, sample_generator, device)
             optimizer.zero_grad(set_to_none=True)
-            loss, train_metrics = baseline_step(model, inputs, actions, targets, args.changed_pixel_weight)
+            if args.rollout_steps > 1:
+                loss, train_metrics = rollout_training_step(model, inputs, actions, targets, args.changed_pixel_weight)
+            else:
+                loss, train_metrics = baseline_step(model, inputs, actions, targets, args.changed_pixel_weight)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
