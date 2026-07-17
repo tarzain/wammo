@@ -23,6 +23,7 @@ Implemented variants:
 - Direct full-frame prediction.
 - Residual prediction initialized as exact copy.
 - Short autoregressive rollout training with `--rollout-steps`.
+- Consequential-window rollout oversampling with `--event-oversample-prob`.
 
 ## Runs
 
@@ -150,3 +151,80 @@ This makes the next baseline lever clear: keep rollout training, but strengthen 
 3. Add a small object/event auxiliary head for note creation and typed glyph pixels.
 
 The useful floor is now defined: a baseline must beat rollout4 stability while increasing short-horizon cursor/key authority without returning to one-step blob behavior.
+
+### Residual, rollout-4, event oversampling + stronger changed-pixel weight
+
+Run: `runs/notepad-next-frame-rollout4-event128-1k`
+
+Command:
+
+```bash
+/venv/main/bin/python -u -m wammo.train.train_notepad_next_frame_baseline \
+  --episodes 1000 \
+  --steps 5000 \
+  --batch-size 64 \
+  --device cuda \
+  --out runs/notepad-next-frame-rollout4-event128-1k \
+  --log-every 250 \
+  --checkpoint-every 1000 \
+  --ladder-every 1000 \
+  --eval-episodes 16 \
+  --hidden-channels 64 \
+  --blocks 4 \
+  --predict-residual \
+  --rollout-steps 4 \
+  --event-oversample-prob 0.75 \
+  --changed-pixel-weight 128 \
+  --generate-progress-every 100
+```
+
+Dataset window counts:
+
+- Rollout starts: `60000`
+- Consequential rollout starts: `49011`
+
+Final scalar metrics:
+
+- Eval loss: `0.1449`
+- Eval MAE: `0.0206`
+- Changed-pixel MAE: `0.1891`
+- Unchanged-pixel MAE: `0.0168`
+- Changed-pixel rate: `0.0221`
+
+Final calibrated authority ratios:
+
+| Channel | h1 | h4 | h8 | h16 |
+| --- | ---: | ---: | ---: | ---: |
+| cursor | 0.505 | 0.659 | 0.904 | 1.287 |
+| click | 4.015 | 3.790 | 3.713 | 4.041 |
+| key | 0.692 | 0.222 | 0.174 | 0.266 |
+
+Comparison against rollout-4 baseline at step 5000:
+
+| Metric | rollout4 | event128 |
+| --- | ---: | ---: |
+| Eval MAE | 0.0123 | 0.0206 |
+| Changed-pixel MAE | 0.2327 | 0.1891 |
+| Unchanged-pixel MAE | 0.0073 | 0.0168 |
+| cursor h4 | 0.579 | 0.659 |
+| click h4 | 2.379 | 3.790 |
+| key h4 | 0.065 | 0.222 |
+| key h16 | 0.470 | 0.266 |
+
+Interpretation:
+
+- This arm improves changed-pixel MAE and short-horizon key authority.
+- It worsens unchanged-pixel fidelity and overdrives click more strongly.
+- Visuals show a stronger, cleaner note-like block after mouse-down, but typing still does not produce a real glyph.
+- It is still not hands-on playable.
+
+Artifacts:
+
+- `runs/notepad-next-frame-rollout4-event128-1k/checkpoint_step_5000.pt`
+- `runs/notepad-next-frame-rollout4-event128-1k/analysis/calibrated_ladder_step_5000.json`
+- `runs/notepad-next-frame-rollout4-event128-1k/rollouts/step_5000/fixed_action_rows.png`
+- `runs/notepad-next-frame-rollout4-event128-1k/rollouts/step_5000/scripted_sequence.png`
+
+Updated conclusion:
+
+Event oversampling plus higher changed-pixel weight is directionally useful for sparse consequences, but it is not sufficient. The baseline now needs structure, not just more weighting: either separate residual heads for cursor/note/glyph layers, or an auxiliary parser/object-state loss that directly supervises note creation and typed glyph persistence.
