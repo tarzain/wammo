@@ -97,3 +97,32 @@ def test_rollout_training_step_is_finite():
 
     assert torch.isfinite(loss)
     assert metrics["changed_pixel_rate"] > 0
+
+
+def test_rollout_event_starts_include_sparse_key_windows():
+    frames = np.zeros((1, 8, 96, 96, 3), dtype=np.uint8)
+    actions = np.zeros((1, 8, 4), dtype=np.float32)
+    actions[0, 5, 3] = 7
+    dataset = NotePadFramePairs(frames, actions, motion_oversample=False)
+
+    starts, event_starts = dataset.rollout_starts(rollout_steps=2)
+
+    assert len(starts) == 6
+    assert event_starts.tolist() == [[0, 3], [0, 4]]
+
+
+def test_rollout_event_oversampling_uses_event_pool():
+    frames = np.zeros((1, 8, 96, 96, 3), dtype=np.uint8)
+    actions = np.zeros((1, 8, 4), dtype=np.float32)
+    actions[0, 5, 3] = 7
+    dataset = NotePadFramePairs(frames, actions, motion_oversample=False)
+
+    _, action_chunks, _ = dataset.sample_rollout(
+        batch_size=16,
+        rollout_steps=2,
+        generator=torch.Generator().manual_seed(0),
+        device=torch.device("cpu"),
+        event_oversample_prob=1.0,
+    )
+
+    assert (action_chunks[..., 3] == 7).any(dim=1).all()

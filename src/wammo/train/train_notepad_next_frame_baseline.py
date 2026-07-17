@@ -84,6 +84,7 @@ class NotePadFramePairs:
         self.motion_oversample = motion_oversample
         self.pairs = self._pairs()
         self.motion_pairs = self._motion_pairs()
+        self.rollout_start_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         spec = load_spec()
         self.max_delta = float(spec["cursor"]["max_delta"])
         self.key_count = len(spec["keys"])
@@ -105,16 +106,21 @@ class NotePadFramePairs:
         rollout_steps: int,
         generator: torch.Generator,
         device: torch.device,
+        event_oversample_prob: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if rollout_steps < 1:
             raise ValueError("rollout_steps must be >= 1")
-        max_start = self.frames.shape[1] - rollout_steps - 1
-        if max_start < 0:
-            raise ValueError(f"rollout_steps={rollout_steps} exceeds episode length {self.frames.shape[1]}")
-        episode_idx = torch.randint(self.frames.shape[0], (batch_size,), generator=generator).numpy()
-        start_idx = torch.randint(max_start + 1, (batch_size,), generator=generator).numpy()
+        all_starts, event_starts = self.rollout_starts(rollout_steps)
+        if event_oversample_prob > 0 and len(event_starts):
+            use_event = torch.rand((batch_size,), generator=generator).numpy() < event_oversample_prob
+            event_idx = torch.randint(len(event_starts), (batch_size,), generator=generator).numpy()
+            all_idx = torch.randint(len(all_starts), (batch_size,), generator=generator).numpy()
+            selected = np.where(use_event[:, None], event_starts[event_idx], all_starts[all_idx])
+        else:
+            start_idx = torch.randint(len(all_starts), (batch_size,), generator=generator).numpy()
+            selected = all_starts[start_idx]
         input_frames, target_frames, action_chunks = [], [], []
-        for ep, start in zip(episode_idx, start_idx, strict=True):
+        for ep, start in selected:
             input_frames.append(self.frames[int(ep), int(start)])
             target_frames.append(self.frames[int(ep), int(start) + 1 : int(start) + 1 + rollout_steps])
             action_chunks.append(self.actions[int(ep), int(start) + 1 : int(start) + 1 + rollout_steps])
@@ -123,6 +129,26 @@ class NotePadFramePairs:
             normalize_actions(np.stack(action_chunks), self.max_delta).to(device),
             rollout_frames_to_btchw(np.stack(target_frames)).to(device),
         )
+
+    def rollout_starts(self, rollout_steps: int) -> tuple[np.ndarray, np.ndarray]:
+        if rollout_steps in self.rollout_start_cache:
+            return self.rollout_start_cache[rollout_steps]
+        max_start = self.frames.shape[1] - rollout_steps - 1
+        if max_start < 0:
+            raise ValueError(f"rollout_steps={rollout_steps} exceeds episode length {self.frames.shape[1]}")
+        starts = []
+        event_starts = []
+        for ep in range(self.frames.shape[0]):
+            for start in range(max_start + 1):
+                starts.append((ep, start))
+                if self._rollout_window_has_event(ep, start, rollout_steps):
+                    event_starts.append((ep, start))
+        all_starts = np.asarray(starts, dtype=np.int64)
+        event_array = np.asarray(event_starts, dtype=np.int64)
+        if event_array.size == 0:
+            event_array = event_array.reshape(0, 2)
+        self.rollout_start_cache[rollout_steps] = (all_starts, event_array)
+        return all_starts, event_array
 
     def all_pairs(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         input_frames = self.frames[self.pairs[:, 0], self.pairs[:, 1] - 1]
@@ -142,6 +168,14 @@ class NotePadFramePairs:
             if changed or abs(action[0]) > 0.5 or abs(action[1]) > 0.5 or action[2] > 0 or action[3] > 0:
                 pairs.append((ep, t))
         return np.asarray(pairs, dtype=np.int64)
+
+    def _rollout_window_has_event(self, ep: int, start: int, rollout_steps: int) -> bool:
+        actions = self.actions[ep, start + 1 : start + 1 + rollout_steps]
+        if bool(((actions[:, 2] > 0) | (actions[:, 3] > 0)).any()):
+            return True
+        prev = self.frames[ep, start : start + rollout_steps].astype(np.int16)
+        nxt = self.frames[ep, start + 1 : start + 1 + rollout_steps].astype(np.int16)
+        return bool(np.abs(nxt - prev).mean(axis=(1, 2, 3)).max() > 1.0)
 
 
 def frames_to_bchw(frames: np.ndarray) -> torch.Tensor:
@@ -425,6 +459,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--predict-residual", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--changed-pixel-weight", type=float, default=64.0)
     parser.add_argument("--rollout-steps", type=int, default=1)
+    parser.add_argument("--event-oversample-prob", type=float, default=0.0)
     parser.add_argument("--motion-oversample", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--generate-progress-every", type=int, default=100)
     return parser.parse_args()
@@ -457,10 +492,17 @@ def main() -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     args.out.mkdir(parents=True, exist_ok=True)
+    rollout_starts, event_starts = train_dataset.rollout_starts(args.rollout_steps)
     payload = {
         "args": vars(args) | {"out": str(args.out)},
         "model": asdict(config),
-        "train_dataset": train_metadata | {"pairs": int(len(train_dataset.pairs)), "motion_pairs": int(len(train_dataset.motion_pairs))},
+        "train_dataset": train_metadata
+        | {
+            "pairs": int(len(train_dataset.pairs)),
+            "motion_pairs": int(len(train_dataset.motion_pairs)),
+            "rollout_starts": int(len(rollout_starts)),
+            "event_rollout_starts": int(len(event_starts)),
+        },
         "eval_dataset": eval_metadata,
     }
     (args.out / "config.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -472,7 +514,13 @@ def main() -> None:
         for step in range(1, args.steps + 1):
             model.train()
             if args.rollout_steps > 1:
-                inputs, actions, targets = train_dataset.sample_rollout(args.batch_size, args.rollout_steps, sample_generator, device)
+                inputs, actions, targets = train_dataset.sample_rollout(
+                    args.batch_size,
+                    args.rollout_steps,
+                    sample_generator,
+                    device,
+                    event_oversample_prob=args.event_oversample_prob,
+                )
             else:
                 inputs, actions, targets = train_dataset.sample(args.batch_size, sample_generator, device)
             optimizer.zero_grad(set_to_none=True)
