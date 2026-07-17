@@ -11,7 +11,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from wammo.eval.divergence_ladder import notepad_divergence_ladder
+from wammo.eval.divergence_ladder import action_variants, changed_patch_mask, channel_divergence, notepad_divergence_ladder
 from wammo.eval.notepad_pixels import cursor_positions_from_actions
 from wammo.model.dit import MicroWAMConfig
 from wammo.model.flow import euler_step_toward_data, interpolate, velocity_target
@@ -83,6 +83,9 @@ class NotePadHybridModel(NotePadJointModel):
         sigma_action: torch.Tensor,
         chunk_ids: torch.Tensor,
         action_drop: torch.Tensor | None = None,
+        context_video_patches: torch.Tensor | None = None,
+        context_actions: torch.Tensor | None = None,
+        context_chunk_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         video_hidden, action_hidden = self.encode_hidden(
             video_patches,
@@ -93,6 +96,9 @@ class NotePadHybridModel(NotePadJointModel):
             sigma_action,
             chunk_ids,
             action_drop,
+            context_video_patches,
+            context_actions,
+            context_chunk_ids,
         )
         frame_hidden = video_hidden.mean(dim=2)
         if self.head_sigma_conditioned:
@@ -118,6 +124,9 @@ class NotePadHybridModel(NotePadJointModel):
         sigma_action: torch.Tensor,
         chunk_ids: torch.Tensor,
         action_drop: torch.Tensor | None = None,
+        context_video_patches: torch.Tensor | None = None,
+        context_actions: torch.Tensor | None = None,
+        context_chunk_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         b, c, p, d = video_patches.shape
         if (c, p, d) != (self.config.chunk_frames, self.config.patches_per_frame, self.config.patch_dim):
@@ -131,10 +140,46 @@ class NotePadHybridModel(NotePadJointModel):
         action_tokens = self.delta_in(delta_actions) + self.button_in(button_ids) + self.key_in(key_ids)
         video_tokens = video_tokens + self.video_pos + chunk_tokens + self.video_sigma(sigma_video.reshape(b, 1)).unsqueeze(1)
         action_tokens = action_tokens + self.action_pos + chunk_tokens + self.action_sigma(sigma_action.reshape(b, 1)).unsqueeze(1)
-        hidden = self.backbone(torch.cat([video_tokens, action_tokens], dim=1))
-        video_hidden = hidden[:, : c * p].reshape(b, c, p, self.config.d_model)
-        action_hidden = hidden[:, c * p :]
+        current_tokens = torch.cat([video_tokens, action_tokens], dim=1)
+        context_tokens = self._context_tokens(context_video_patches, context_actions, context_chunk_ids, b)
+        tokens = current_tokens if context_tokens is None else torch.cat([context_tokens, current_tokens], dim=1)
+        hidden = self.backbone(tokens)
+        current_hidden = hidden[:, -current_tokens.shape[1] :]
+        video_hidden = current_hidden[:, : c * p].reshape(b, c, p, self.config.d_model)
+        action_hidden = current_hidden[:, c * p :]
         return video_hidden, action_hidden
+
+    def _context_tokens(
+        self,
+        context_video_patches: torch.Tensor | None,
+        context_actions: torch.Tensor | None,
+        context_chunk_ids: torch.Tensor | None,
+        batch_size: int,
+    ) -> torch.Tensor | None:
+        if context_video_patches is None:
+            return None
+        if context_actions is None or context_chunk_ids is None:
+            raise ValueError("context actions and chunk ids are required with context video")
+        b, k, c, p, d = context_video_patches.shape
+        if b != batch_size or (c, p, d) != (self.config.chunk_frames, self.config.patches_per_frame, self.config.patch_dim):
+            raise ValueError(f"unexpected context video shape {tuple(context_video_patches.shape)}")
+        if context_actions.shape != (b, k, c, 4):
+            raise ValueError(f"unexpected context action shape {tuple(context_actions.shape)}")
+        if context_chunk_ids.shape != (b, k):
+            raise ValueError(f"unexpected context chunk id shape {tuple(context_chunk_ids.shape)}")
+        flat_video = context_video_patches.reshape(b * k, c, p, d)
+        flat_actions = context_actions.reshape(b * k, c, context_actions.shape[-1])
+        flat_ids = context_chunk_ids.reshape(b * k)
+        chunk_tokens = self.chunk_pos(flat_ids).unsqueeze(1)
+        video_tokens = self.video_in(flat_video).reshape(b * k, c * p, self.config.d_model)
+        action_tokens = (
+            self.delta_in(flat_actions[..., 0:2])
+            + self.button_in(flat_actions[..., 2].long())
+            + self.key_in(flat_actions[..., 3].long())
+        )
+        video_tokens = video_tokens + self.video_pos + chunk_tokens + self.video_sigma(torch.zeros((b * k, 1), device=flat_video.device)).unsqueeze(1)
+        action_tokens = action_tokens + self.action_pos + chunk_tokens + self.action_sigma(torch.zeros((b * k, 1), device=flat_video.device)).unsqueeze(1)
+        return torch.cat([video_tokens, action_tokens], dim=1).reshape(b, k * (c * p + c), self.config.d_model)
 
 
 def hybrid_video_patches(frames: torch.Tensor, input_mode: str, patch_size: int = 4) -> torch.Tensor:
@@ -197,6 +242,17 @@ class NotePadHybridChunks:
     def sample(
         self, batch_size: int, generator: torch.Generator, device: torch.device
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        video, actions, positions, chunk_ids, _, _, _ = self._sample_arrays(batch_size, generator, device, context_chunks=0)
+        return video, actions, positions, chunk_ids
+
+    def sample_with_context(
+        self, batch_size: int, generator: torch.Generator, device: torch.device, context_chunks: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self._sample_arrays(batch_size, generator, device, context_chunks=context_chunks)
+
+    def _sample_arrays(
+        self, batch_size: int, generator: torch.Generator, device: torch.device, context_chunks: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
         if self.motion_oversample and len(self.motion_pairs):
             pair_idx = torch.randint(len(self.motion_pairs), (batch_size,), generator=generator).numpy()
             pairs = self.motion_pairs[pair_idx]
@@ -206,15 +262,35 @@ class NotePadHybridChunks:
             episode_idx = torch.randint(self.frames.shape[0], (batch_size,), generator=generator).numpy()
             chunk_idx = torch.randint(self.chunks_per_episode, (batch_size,), generator=generator).numpy()
         video_chunks, action_chunks, position_chunks = [], [], []
+        context_video_chunks, context_action_chunks, context_chunk_ids = [], [], []
         for ep, chunk in zip(episode_idx, chunk_idx, strict=True):
             start = int(chunk) * self.chunk_frames
             video_chunks.append(self.frames[int(ep), start : start + self.chunk_frames])
             action_chunks.append(self.actions[int(ep), start : start + self.chunk_frames])
             position_chunks.append(self.positions[int(ep), start : start + self.chunk_frames])
+            if context_chunks > 0:
+                ctx_video, ctx_action, ctx_ids = self._context_arrays(int(ep), int(chunk), context_chunks)
+                context_video_chunks.append(ctx_video)
+                context_action_chunks.append(ctx_action)
+                context_chunk_ids.append(ctx_ids)
         video = normalize_frames(np.stack(video_chunks)).to(device)
         actions = normalize_notepad_actions(np.stack(action_chunks), self.max_delta, self.key_count).to(device)
         positions = normalize_positions(np.stack(position_chunks), self.width, self.height).to(device)
-        return patchify(video), actions, positions, torch.as_tensor(chunk_idx, dtype=torch.long, device=device)
+        chunk_ids = torch.as_tensor(chunk_idx, dtype=torch.long, device=device)
+        if context_chunks <= 0:
+            return patchify(video), actions, positions, chunk_ids, None, None, None
+        context_video = normalize_frames(np.stack(context_video_chunks)).to(device)
+        context_actions = normalize_notepad_actions(np.stack(context_action_chunks), self.max_delta, self.key_count).to(device)
+        flat_context_video = context_video.reshape(batch_size * context_chunks, self.chunk_frames, self.height, self.width, 3)
+        return (
+            patchify(video),
+            actions,
+            positions,
+            chunk_ids,
+            patchify(flat_context_video).reshape(batch_size, context_chunks, self.chunk_frames, -1, 4 * 4 * 3),
+            context_actions,
+            torch.as_tensor(np.stack(context_chunk_ids), dtype=torch.long, device=device),
+        )
 
     def all_chunks(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         video = normalize_frames(self.frames.reshape(-1, *self.frames.shape[2:])).reshape(
@@ -226,6 +302,48 @@ class NotePadHybridChunks:
         positions = normalize_positions(self.positions.reshape(-1, self.chunk_frames, 2), self.width, self.height)
         chunk_ids = torch.arange(self.chunks_per_episode).repeat(self.frames.shape[0])
         return patchify(video).to(device), actions.to(device), positions.to(device), chunk_ids.to(device)
+
+    def all_chunks_with_context(
+        self, device: torch.device, context_chunks: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        video_all, actions_all, positions_all, chunk_ids = self.all_chunks(device)
+        context_video_chunks, context_action_chunks, context_chunk_ids = [], [], []
+        for ep in range(self.frames.shape[0]):
+            for chunk in range(self.chunks_per_episode):
+                ctx_video, ctx_action, ctx_ids = self._context_arrays(ep, chunk, context_chunks)
+                context_video_chunks.append(ctx_video)
+                context_action_chunks.append(ctx_action)
+                context_chunk_ids.append(ctx_ids)
+        context_video = normalize_frames(np.stack(context_video_chunks)).to(device)
+        context_actions = normalize_notepad_actions(np.stack(context_action_chunks), self.max_delta, self.key_count).to(device)
+        batch_chunks = context_video.shape[0]
+        flat_context_video = context_video.reshape(batch_chunks * context_chunks, self.chunk_frames, self.height, self.width, 3)
+        context_video = patchify(flat_context_video).reshape(batch_chunks, context_chunks, self.chunk_frames, -1, 4 * 4 * 3)
+        return (
+            video_all,
+            actions_all,
+            positions_all,
+            chunk_ids,
+            context_video,
+            context_actions,
+            torch.as_tensor(np.stack(context_chunk_ids), dtype=torch.long, device=device),
+        )
+
+    def _context_arrays(self, ep: int, chunk: int, context_chunks: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        video_context, action_context, chunk_ids = [], [], []
+        blank_video = np.zeros((self.chunk_frames, self.height, self.width, 3), dtype=np.uint8)
+        blank_actions = np.zeros((self.chunk_frames, self.actions.shape[-1]), dtype=np.float32)
+        for ctx_chunk in range(chunk - context_chunks, chunk):
+            if ctx_chunk < 0:
+                video_context.append(blank_video)
+                action_context.append(blank_actions)
+                chunk_ids.append(0)
+                continue
+            start = ctx_chunk * self.chunk_frames
+            video_context.append(self.frames[ep, start : start + self.chunk_frames])
+            action_context.append(self.actions[ep, start : start + self.chunk_frames])
+            chunk_ids.append(ctx_chunk)
+        return np.stack(video_context), np.stack(action_context), np.asarray(chunk_ids, dtype=np.int64)
 
     def _motion_pairs(self) -> np.ndarray:
         pairs = []
@@ -272,6 +390,9 @@ def hybrid_training_step(
     sigma_corner_weight: float = 0.0,
     sigma_corner_low: float = 0.0,
     sigma_corner_high: float = 1.0,
+    context_video: torch.Tensor | None = None,
+    context_actions: torch.Tensor | None = None,
+    context_chunk_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     b = video_clean.shape[0]
     delta_clean = action_clean[..., 0:2]
@@ -296,7 +417,17 @@ def hybrid_training_step(
     video_target = velocity_target(video_clean, video_noise)
     delta_target = velocity_target(delta_clean, delta_noise)
     video_pred, delta_pred, dx_logits, dy_logits, button_logits, key_logits, cursor_pred = model.forward_all(
-        video_noisy, delta_noisy, button_target, key_target, t_video, t_action, chunk_ids, action_drop
+        video_noisy,
+        delta_noisy,
+        button_target,
+        key_target,
+        t_video,
+        t_action,
+        chunk_ids,
+        action_drop,
+        context_video,
+        context_actions,
+        context_chunk_ids,
     )
     video_loss = F.mse_loss(video_pred, video_target)
     delta_loss = F.mse_loss(delta_pred, delta_target)
@@ -330,12 +461,78 @@ def denoise_once_hybrid(
     button_ids: torch.Tensor,
     key_ids: torch.Tensor,
     chunk_ids: torch.Tensor,
+    context_video: torch.Tensor | None = None,
+    context_actions: torch.Tensor | None = None,
+    context_chunk_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     b = video_noise.shape[0]
     t = torch.ones((b,), device=video_noise.device)
-    out = model.forward_all(video_noise, delta_noise, button_ids, key_ids, t, t, chunk_ids)
+    out = model.forward_all(
+        video_noise,
+        delta_noise,
+        button_ids,
+        key_ids,
+        t,
+        t,
+        chunk_ids,
+        context_video_patches=context_video,
+        context_actions=context_actions,
+        context_chunk_ids=context_chunk_ids,
+    )
     video_v, delta_v, *_ = out
     return euler_step_toward_data(video_noise, video_v, dt=1.0), euler_step_toward_data(delta_noise, delta_v, dt=1.0), *out[2:]
+
+
+@torch.no_grad()
+def notepad_context_divergence_ladder(
+    model: NotePadHybridModel,
+    video_clean: torch.Tensor,
+    action_clean: torch.Tensor,
+    chunk_ids: torch.Tensor,
+    context_video: torch.Tensor,
+    context_actions: torch.Tensor,
+    context_chunk_ids: torch.Tensor,
+    key_index: int,
+    seed: int = 2024,
+) -> dict[str, float]:
+    model.eval()
+    generator = torch.Generator(device=video_clean.device).manual_seed(seed)
+    video_noise = torch.randn(video_clean.shape, device=video_clean.device, generator=generator)
+    changed_mask = changed_patch_mask(video_clean)
+    results: dict[str, float] = {}
+    for channel in ("cursor", "click", "key"):
+        positive, negative = action_variants(action_clean, channel, key_index)
+        pos_video = denoise_video_with_context(model, video_noise, positive, chunk_ids, context_video, context_actions, context_chunk_ids)
+        neg_video = denoise_video_with_context(model, video_noise, negative, chunk_ids, context_video, context_actions, context_chunk_ids)
+        results.update(channel_divergence(channel, pos_video, neg_video, changed_mask, (1, 2, 3, 4)))
+    return results
+
+
+def denoise_video_with_context(
+    model: NotePadHybridModel,
+    video_noise: torch.Tensor,
+    actions: torch.Tensor,
+    chunk_ids: torch.Tensor,
+    context_video: torch.Tensor,
+    context_actions: torch.Tensor,
+    context_chunk_ids: torch.Tensor,
+) -> torch.Tensor:
+    b = video_noise.shape[0]
+    sigma_video = torch.ones((b,), device=video_noise.device)
+    sigma_action = torch.zeros((b,), device=video_noise.device)
+    video_velocity, *_ = model.forward_all(
+        video_noise,
+        actions[..., 0:2],
+        actions[..., 2].long(),
+        actions[..., 3].long(),
+        sigma_video,
+        sigma_action,
+        chunk_ids,
+        context_video_patches=context_video,
+        context_actions=context_actions,
+        context_chunk_ids=context_chunk_ids,
+    )
+    return euler_step_toward_data(video_noise, video_velocity, dt=1.0)
 
 
 @torch.no_grad()
@@ -351,13 +548,20 @@ def evaluate_hybrid(
     sigma_corner_weight: float = 0.0,
     sigma_corner_low: float = 0.0,
     sigma_corner_high: float = 1.0,
+    context_chunks: int = 0,
     seed: int = 999,
 ) -> dict[str, float]:
     spec = load_spec()
     key_count = len(spec["keys"])
     generator = torch.Generator(device=device).manual_seed(seed)
     model.eval()
-    video_clean, action_clean, position_clean, chunk_ids = dataset.all_chunks(device)
+    context_video = context_actions = context_chunk_ids = None
+    if context_chunks > 0:
+        video_clean, action_clean, position_clean, chunk_ids, context_video, context_actions, context_chunk_ids = dataset.all_chunks_with_context(
+            device, context_chunks
+        )
+    else:
+        video_clean, action_clean, position_clean, chunk_ids = dataset.all_chunks(device)
     loss, metrics = hybrid_training_step(
         model,
         video_clean,
@@ -373,6 +577,9 @@ def evaluate_hybrid(
         sigma_corner_weight=sigma_corner_weight,
         sigma_corner_low=sigma_corner_low,
         sigma_corner_high=sigma_corner_high,
+        context_video=context_video,
+        context_actions=context_actions,
+        context_chunk_ids=context_chunk_ids,
     )
     del loss
     video_noise = torch.randn(video_clean.shape, device=device, generator=generator)
@@ -387,7 +594,7 @@ def evaluate_hybrid(
         button_logits,
         key_logits,
         cursor_pred,
-    ) = denoise_once_hybrid(model, video_noise, delta_noise, button_true, key_true, chunk_ids)
+    ) = denoise_once_hybrid(model, video_noise, delta_noise, button_true, key_true, chunk_ids, context_video, context_actions, context_chunk_ids)
     raw_true = denormalize_notepad_actions(action_clean, float(spec["cursor"]["max_delta"]), key_count)
     raw_flow = raw_true.clone()
     raw_flow[..., 0:2] = delta_denoised.clamp(-1, 1) * float(spec["cursor"]["max_delta"])
@@ -433,6 +640,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ladder-every", type=int, default=500)
     parser.add_argument("--checkpoint-every", type=int, default=0)
+    parser.add_argument("--context-chunks", type=int, default=0)
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--n-layers", type=int, default=4)
     parser.add_argument("--n-heads", type=int, default=4)
@@ -497,7 +705,13 @@ def main() -> None:
     start = time.time()
     with (args.out / "metrics.jsonl").open("w", encoding="utf-8") as f:
         for step in range(1, args.steps + 1):
-            video, actions, positions, chunk_ids = train_dataset.sample(args.batch_size, sample_generator, device)
+            context_video = context_actions = context_chunk_ids = None
+            if args.context_chunks > 0:
+                video, actions, positions, chunk_ids, context_video, context_actions, context_chunk_ids = train_dataset.sample_with_context(
+                    args.batch_size, sample_generator, device, args.context_chunks
+                )
+            else:
+                video, actions, positions, chunk_ids = train_dataset.sample(args.batch_size, sample_generator, device)
             optimizer.zero_grad(set_to_none=True)
             loss, train_metrics = hybrid_training_step(
                 model,
@@ -514,6 +728,9 @@ def main() -> None:
                 args.sigma_corner_weight,
                 args.sigma_corner_low,
                 args.sigma_corner_high,
+                context_video,
+                context_actions,
+                context_chunk_ids,
             )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -531,18 +748,36 @@ def main() -> None:
                     args.sigma_corner_weight,
                     args.sigma_corner_low,
                     args.sigma_corner_high,
+                    args.context_chunks,
                 )
                 if args.ladder_every > 0 and (step == 1 or step % args.ladder_every == 0 or step == args.steps):
-                    video_all, action_all, _, chunk_ids_all = eval_dataset.all_chunks(device)
-                    eval_metrics.update(
-                        notepad_divergence_ladder(
-                            model,
-                            video_all,
-                            action_all,
-                            chunk_ids_all,
-                            key_index=load_spec()["keys"].index("h"),
+                    if args.context_chunks > 0:
+                        video_all, action_all, _, chunk_ids_all, ctx_video_all, ctx_action_all, ctx_ids_all = eval_dataset.all_chunks_with_context(
+                            device, args.context_chunks
                         )
-                    )
+                        eval_metrics.update(
+                            notepad_context_divergence_ladder(
+                                model,
+                                video_all,
+                                action_all,
+                                chunk_ids_all,
+                                ctx_video_all,
+                                ctx_action_all,
+                                ctx_ids_all,
+                                key_index=load_spec()["keys"].index("h"),
+                            )
+                        )
+                    else:
+                        video_all, action_all, _, chunk_ids_all = eval_dataset.all_chunks(device)
+                        eval_metrics.update(
+                            notepad_divergence_ladder(
+                                model,
+                                video_all,
+                                action_all,
+                                chunk_ids_all,
+                                key_index=load_spec()["keys"].index("h"),
+                            )
+                        )
                 if first_eval is None:
                     first_eval = eval_metrics
                 row = {
@@ -580,7 +815,8 @@ def main() -> None:
         },
         args.out / "checkpoint.pt",
     )
-    write_contact_sheet(model, ContactSheetDatasetAdapter(eval_dataset), args.out / "contact_sheet.png", device)
+    if args.context_chunks == 0:
+        write_contact_sheet(model, ContactSheetDatasetAdapter(eval_dataset), args.out / "contact_sheet.png", device)
     final_eval = evaluate_hybrid(
         model,
         eval_dataset,
@@ -593,11 +829,29 @@ def main() -> None:
         args.sigma_corner_weight,
         args.sigma_corner_low,
         args.sigma_corner_high,
+        args.context_chunks,
     )
-    video_all, action_all, _, chunk_ids_all = eval_dataset.all_chunks(device)
-    final_eval.update(
-        notepad_divergence_ladder(model, video_all, action_all, chunk_ids_all, key_index=load_spec()["keys"].index("h"))
-    )
+    if args.context_chunks > 0:
+        video_all, action_all, _, chunk_ids_all, ctx_video_all, ctx_action_all, ctx_ids_all = eval_dataset.all_chunks_with_context(
+            device, args.context_chunks
+        )
+        final_eval.update(
+            notepad_context_divergence_ladder(
+                model,
+                video_all,
+                action_all,
+                chunk_ids_all,
+                ctx_video_all,
+                ctx_action_all,
+                ctx_ids_all,
+                key_index=load_spec()["keys"].index("h"),
+            )
+        )
+    else:
+        video_all, action_all, _, chunk_ids_all = eval_dataset.all_chunks(device)
+        final_eval.update(
+            notepad_divergence_ladder(model, video_all, action_all, chunk_ids_all, key_index=load_spec()["keys"].index("h"))
+        )
     (args.out / "summary.json").write_text(json.dumps({"first_eval": first_eval, "final_eval": final_eval}, indent=2) + "\n")
 
 
