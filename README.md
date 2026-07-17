@@ -48,7 +48,11 @@ This repo starts at build-order step 1 plus the tokenizer and flow-convention te
 5. Flow matching convention locked to `x_t = (1 - t) * x0 + t * noise`, `v = noise - x0`.
 6. DiT module skeleton for joint video/action chunk denoising.
 
-The NotePad Desk v2 path uses mixed-objective joint modeling: video patches and cursor deltas are trained with flow matching, while discrete mouse/key channels use CE heads from the same joint action-token hidden states. This keeps symbol identity exact without moving button/key prediction into a separate inverse-dynamics model. The current divergence ladder is chunk-local (`h1`-`h4`); true h8/h16 authority requires the next autoregressive rollout evaluator.
+The NotePad Desk v2 path uses mixed-objective joint modeling: video patches and cursor deltas are trained with flow matching, while discrete mouse/key channels use CE heads from the same joint action-token hidden states. This keeps symbol identity exact without moving button/key prediction into a separate inverse-dynamics model. The current long run uses previous-chunk context (`--context-chunks 1`), and post-hoc autoregressive h8/h16 ladder scoring is available in `wammo.eval.autoregressive_ladder`.
+
+Latest results writeup:
+
+- `reports/notepad_long_context_run.md`
 
 Run the NotePad one-episode overfit with divergence ladder logging:
 
