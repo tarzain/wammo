@@ -43,11 +43,26 @@ def denormalize_positions(positions: torch.Tensor, width: int, height: int) -> t
 
 
 class NotePadHybridModel(NotePadJointModel):
-    def __init__(self, config: MicroWAMConfig, key_count: int):
+    def __init__(self, config: MicroWAMConfig, key_count: int, head_sigma_conditioned: bool = False):
         super().__init__(config, key_count)
+        self.head_sigma_conditioned = head_sigma_conditioned
         self.dx_out = nn.Linear(config.d_model, DELTA_BINS)
         self.dy_out = nn.Linear(config.d_model, DELTA_BINS)
         self.cursor_out = nn.Linear(config.d_model, 2)
+        if head_sigma_conditioned:
+            self.action_head_sigma = nn.Sequential(
+                nn.Linear(1, config.d_model),
+                nn.SiLU(),
+                nn.Linear(config.d_model, config.d_model),
+            )
+            self.cursor_head_sigma = nn.Sequential(
+                nn.Linear(1, config.d_model),
+                nn.SiLU(),
+                nn.Linear(config.d_model, config.d_model),
+            )
+        else:
+            self.action_head_sigma = None
+            self.cursor_head_sigma = None
 
     def forward_all(
         self,
@@ -71,6 +86,9 @@ class NotePadHybridModel(NotePadJointModel):
             action_drop,
         )
         frame_hidden = video_hidden.mean(dim=2)
+        if self.head_sigma_conditioned:
+            action_hidden = action_hidden + self.action_head_sigma(sigma_action.reshape(-1, 1)).unsqueeze(1)
+            frame_hidden = frame_hidden + self.cursor_head_sigma(sigma_video.reshape(-1, 1)).unsqueeze(1)
         return (
             self.video_out(video_hidden),
             self.delta_out(action_hidden),
@@ -80,6 +98,40 @@ class NotePadHybridModel(NotePadJointModel):
             self.key_out(action_hidden),
             self.cursor_out(frame_hidden).sigmoid(),
         )
+
+
+def sample_sigma_pair(
+    batch_size: int,
+    device: torch.device,
+    generator: torch.Generator,
+    corner_weight: float = 0.0,
+    corner_low: float = 0.0,
+    corner_high: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    t_video = torch.rand((batch_size,), device=device, generator=generator)
+    t_action = torch.rand((batch_size,), device=device, generator=generator)
+    corner_count = 0
+    inverse_corner_count = 0
+    generation_corner_count = 0
+    if corner_weight > 0:
+        use_corner = torch.rand((batch_size,), device=device, generator=generator) < corner_weight
+        inverse_corner = torch.rand((batch_size,), device=device, generator=generator) < 0.5
+        inverse_mask = use_corner & inverse_corner
+        generation_mask = use_corner & ~inverse_corner
+        t_video = torch.where(inverse_mask, torch.full_like(t_video, corner_low), t_video)
+        t_action = torch.where(inverse_mask, torch.full_like(t_action, corner_high), t_action)
+        t_video = torch.where(generation_mask, torch.full_like(t_video, corner_high), t_video)
+        t_action = torch.where(generation_mask, torch.full_like(t_action, corner_low), t_action)
+        corner_count = int(use_corner.sum())
+        inverse_corner_count = int(inverse_mask.sum())
+        generation_corner_count = int(generation_mask.sum())
+    return t_video, t_action, {
+        "sigma_video_mean": float(t_video.detach().mean()),
+        "sigma_action_mean": float(t_action.detach().mean()),
+        "sigma_corner_rate": float(corner_count / max(1, batch_size)),
+        "sigma_inverse_corner_rate": float(inverse_corner_count / max(1, batch_size)),
+        "sigma_generation_corner_rate": float(generation_corner_count / max(1, batch_size)),
+    }
 
 
 class NotePadHybridChunks:
@@ -176,6 +228,9 @@ def hybrid_training_step(
     delta_weight: float = 4.0,
     delta_ce_weight: float = 1.0,
     cursor_weight: float = 1.0,
+    sigma_corner_weight: float = 0.0,
+    sigma_corner_low: float = 0.0,
+    sigma_corner_high: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     b = video_clean.shape[0]
     delta_clean = action_clean[..., 0:2]
@@ -184,8 +239,14 @@ def hybrid_training_step(
     key_target = action_clean[..., 3].long()
     video_noise = torch.randn(video_clean.shape, device=video_clean.device, generator=generator)
     delta_noise = torch.randn(delta_clean.shape, device=action_clean.device, generator=generator)
-    t_video = torch.rand((b,), device=video_clean.device, generator=generator)
-    t_action = torch.rand((b,), device=video_clean.device, generator=generator)
+    t_video, t_action, sigma_metrics = sample_sigma_pair(
+        b,
+        video_clean.device,
+        generator,
+        sigma_corner_weight,
+        sigma_corner_low,
+        sigma_corner_high,
+    )
     video_noisy = interpolate(video_clean, video_noise, t_video)
     delta_noisy = interpolate(delta_clean, delta_noise, t_action)
     action_drop = None
@@ -216,6 +277,7 @@ def hybrid_training_step(
         "button_loss": float(button_loss.detach()),
         "key_loss": float(key_loss.detach()),
         "cursor_loss": float(cursor_loss.detach()),
+        **sigma_metrics,
     }
 
 
@@ -245,6 +307,9 @@ def evaluate_hybrid(
     delta_weight: float,
     delta_ce_weight: float,
     cursor_weight: float,
+    sigma_corner_weight: float = 0.0,
+    sigma_corner_low: float = 0.0,
+    sigma_corner_high: float = 1.0,
     seed: int = 999,
 ) -> dict[str, float]:
     spec = load_spec()
@@ -264,6 +329,9 @@ def evaluate_hybrid(
         delta_weight=delta_weight,
         delta_ce_weight=delta_ce_weight,
         cursor_weight=cursor_weight,
+        sigma_corner_weight=sigma_corner_weight,
+        sigma_corner_low=sigma_corner_low,
+        sigma_corner_high=sigma_corner_high,
     )
     del loss
     video_noise = torch.randn(video_clean.shape, device=device, generator=generator)
@@ -330,6 +398,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--delta-weight", type=float, default=4.0)
     parser.add_argument("--delta-ce-weight", type=float, default=1.0)
     parser.add_argument("--cursor-weight", type=float, default=1.0)
+    parser.add_argument("--head-sigma-conditioned", action="store_true")
+    parser.add_argument("--sigma-corner-weight", type=float, default=0.0)
+    parser.add_argument("--sigma-corner-low", type=float, default=0.0)
+    parser.add_argument("--sigma-corner-high", type=float, default=1.0)
     parser.add_argument("--generate-progress-every", type=int, default=100)
     return parser.parse_args()
 
@@ -359,7 +431,11 @@ def main() -> None:
         patches_per_frame=24 * 24,
         max_chunks=16,
     )
-    model = NotePadHybridModel(config, key_count=len(load_spec()["keys"])).to(device)
+    model = NotePadHybridModel(
+        config,
+        key_count=len(load_spec()["keys"]),
+        head_sigma_conditioned=args.head_sigma_conditioned,
+    ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     args.out.mkdir(parents=True, exist_ok=True)
@@ -390,6 +466,9 @@ def main() -> None:
                 args.delta_weight,
                 args.delta_ce_weight,
                 args.cursor_weight,
+                args.sigma_corner_weight,
+                args.sigma_corner_low,
+                args.sigma_corner_high,
             )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -404,6 +483,9 @@ def main() -> None:
                     args.delta_weight,
                     args.delta_ce_weight,
                     args.cursor_weight,
+                    args.sigma_corner_weight,
+                    args.sigma_corner_low,
+                    args.sigma_corner_high,
                 )
                 if args.ladder_every > 0 and (step == 1 or step % args.ladder_every == 0 or step == args.steps):
                     video_all, action_all, _, chunk_ids_all = eval_dataset.all_chunks(device)
@@ -433,7 +515,15 @@ def main() -> None:
                     f"key={row['eval_key_accuracy']:.3f}"
                 )
 
-    torch.save({"model": model.state_dict(), "config": asdict(config), "model_kind": "notepad_hybrid"}, args.out / "checkpoint.pt")
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "config": asdict(config),
+            "model_kind": "notepad_hybrid",
+            "head_sigma_conditioned": args.head_sigma_conditioned,
+        },
+        args.out / "checkpoint.pt",
+    )
     write_contact_sheet(model, ContactSheetDatasetAdapter(eval_dataset), args.out / "contact_sheet.png", device)
     final_eval = evaluate_hybrid(
         model,
@@ -444,6 +534,9 @@ def main() -> None:
         args.delta_weight,
         args.delta_ce_weight,
         args.cursor_weight,
+        args.sigma_corner_weight,
+        args.sigma_corner_low,
+        args.sigma_corner_high,
     )
     video_all, action_all, _, chunk_ids_all = eval_dataset.all_chunks(device)
     final_eval.update(

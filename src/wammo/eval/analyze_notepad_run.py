@@ -210,11 +210,15 @@ def load_model(run_dir: Path, device: torch.device) -> NotePadJointModel | NoteP
     if config_payload.get("model_kind") == "notepad_binned_delta":
         model = NotePadBinnedDeltaModel(model_config, key_count=len(load_spec()["keys"])).to(device)
     elif config_payload.get("model_kind") == "notepad_hybrid":
-        model = NotePadHybridModel(model_config, key_count=len(load_spec()["keys"])).to(device)
+        model = NotePadHybridModel(
+            model_config,
+            key_count=len(load_spec()["keys"]),
+            head_sigma_conditioned=bool(config_payload.get("args", {}).get("head_sigma_conditioned", False)),
+        ).to(device)
     else:
         model = NotePadJointModel(model_config, key_count=len(load_spec()["keys"])).to(device)
     checkpoint = torch.load(run_dir / "checkpoint.pt", map_location=device)
-    model.load_state_dict(checkpoint["model"])
+    model.load_state_dict(checkpoint["model"], strict=False)
     model.eval()
     return model
 

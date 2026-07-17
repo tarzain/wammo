@@ -172,3 +172,25 @@ The larger-cursor checkpoint has the same qualitative curves: cursor localizatio
 Read: the cleanest version of the hypothesis is not confirmed. The cursor head is not secretly near-ceiling at low σ; it is already bad on clean video. But the sigma cut does explain part of the delta story: the CE inverse head mostly exploits low-noise action-token self-information, not video-derived inverse dynamics. When action tokens are fully noisy, clean video does not rescue delta prediction. That is a more specific failure than "video noising erases the cursor": the current action-prediction path is not forced to compute displacement from video.
 
 Decision update: the next intervention should not be another cursor-size or patch-size screen. First inspect heatmap predictions and delta CE predictions against marginals, then test a stricter inverse-dynamics setup where action tokens are masked/noised while video is clean and the head must read frame-to-frame displacement. The result also strengthens the case for decoupled σ schedules or explicit low-σ/action-mask training for action prediction, but only after confirming the heads are not simply learning marginal priors.
+
+## Corner-weighted sigma hybrid arm
+
+Run: `runs/notepad-1k-hybrid-corner-sigma`
+
+Change: the hybrid objective was rerun with σ-conditioned readout heads and a corner-weighted σ sampler. Half of training samples are assigned to one of the two forced corners:
+
+- inverse-dynamics corner: `σ_video=0, σ_action=1`
+- action-conditioned generation corner: `σ_video=1, σ_action=0`
+
+Everything else stays on the 1k hybrid recipe: motion oversampling, continuous deltas in the joint denoising stream, `delta_weight=4`, binned dx/dy CE heads, and cursor coordinate aux loss.
+
+Same hybrid σ stratifier, 64 eval episodes:
+
+| run | head σ cond | cursor MAE at σv=0 px | CE motion MAE, clean action px | CE motion MAE, noisy action px | flow motion MAE, noisy action px | cursor h4 ladder |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| `runs/notepad-1k-hybrid` | no | 25.329 | 0.488 | 4.755 | 4.590 | 1.696e-3 |
+| `runs/notepad-1k-hybrid-corner-sigma` | yes | 17.049 | 0.333 | 4.531 | 4.747 | 1.872e-3 |
+
+Read: the intervention moved the intended leak metric, but only modestly. Fully-noisy-action CE inverse dynamics improved from `4.755 px` to `4.531 px`, so corner pressure helped. It did not solve the problem: the head still performs close to the trivial motion baseline when action tokens carry no self-information. The flow path did not improve on the same corner. Cursor coordinate prediction and ladder authority both improved, suggesting σ-conditioned readouts/corner training are useful, but not sufficient to force video-grounded inverse dynamics.
+
+Decision: keep the corner-weighted σ sampler and σ-conditioned heads as positive infrastructure, but do not launch 100k from this arm. The next narrow test should remove the action-token shortcut more aggressively for inverse losses: train a dedicated masked-action inverse arm where `δ_input` is always null/noise for the CE head while video is clean or lightly noised. If that beats the `4.53 px` noisy-action number, the failure was shortcut competition; if it does not, the missing computation is temporal video differencing inside the trunk.
