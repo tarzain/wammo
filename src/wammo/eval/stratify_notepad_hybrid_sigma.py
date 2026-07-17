@@ -22,6 +22,7 @@ from wammo.train.train_notepad_hybrid import (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", type=Path, required=True)
+    parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     parser.add_argument("--eval-episodes", type=int, default=64)
     parser.add_argument("--eval-seed", type=int, default=None)
@@ -32,9 +33,12 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_model(run: Path, device: torch.device) -> tuple[NotePadHybridModel, dict[str, object], dict[str, object]]:
+def load_model(
+    run: Path, checkpoint_path: Path | None, device: torch.device
+) -> tuple[NotePadHybridModel, dict[str, object], dict[str, object]]:
     config_payload = json.loads((run / "config.json").read_text())
-    checkpoint = torch.load(run / "checkpoint.pt", map_location=device)
+    resolved_checkpoint = checkpoint_path or (run / "checkpoint.pt")
+    checkpoint = torch.load(resolved_checkpoint, map_location=device)
     config = MicroWAMConfig(**checkpoint["config"])
     run_args = config_payload.get("args", {})
     head_sigma_conditioned = bool(checkpoint.get("head_sigma_conditioned", run_args.get("head_sigma_conditioned", False)))
@@ -48,6 +52,8 @@ def load_model(run: Path, device: torch.device) -> tuple[NotePadHybridModel, dic
     return model, config_payload, {
         "config": asdict(config),
         "head_sigma_conditioned": head_sigma_conditioned,
+        "checkpoint": str(resolved_checkpoint),
+        "step": checkpoint.get("step"),
     }
 
 
@@ -70,7 +76,20 @@ def evaluate_at_sigmas(
     noise_seed: int,
 ) -> dict[str, list[dict[str, float]]]:
     model.eval()
-    video_all, action_all, position_all, chunk_id_all = dataset.all_chunks(torch.device("cpu"))
+    context_chunks = int(getattr(model, "_wammo_context_chunks", 0))
+    if context_chunks > 0:
+        (
+            video_all,
+            action_all,
+            position_all,
+            chunk_id_all,
+            context_video_all,
+            context_action_all,
+            context_id_all,
+        ) = dataset.all_chunks_with_context(torch.device("cpu"), context_chunks)
+    else:
+        video_all, action_all, position_all, chunk_id_all = dataset.all_chunks(torch.device("cpu"))
+        context_video_all = context_action_all = context_id_all = None
     output: dict[str, list[dict[str, float]]] = {
         "cursor_by_video_sigma_clean_action": [],
         "delta_by_action_sigma_clean_video": [],
@@ -90,6 +109,11 @@ def evaluate_at_sigmas(
             actions = action_all[start:end].to(device)
             positions = position_all[start:end].to(device)
             chunk_ids = chunk_id_all[start:end].to(device)
+            context_video = context_action = context_ids = None
+            if context_video_all is not None and context_action_all is not None and context_id_all is not None:
+                context_video = context_video_all[start:end].to(device)
+                context_action = context_action_all[start:end].to(device)
+                context_ids = context_id_all[start:end].to(device)
             video_noise = _noise(video.shape, device, noise_seed + start + 17)
             delta_noise = _noise(actions[..., 0:2].shape, device, noise_seed + start + 31)
             button = actions[..., 2].long()
@@ -108,6 +132,9 @@ def evaluate_at_sigmas(
                 sigma_video=sigma,
                 sigma_action=0.0,
                 dataset=dataset,
+                context_video=context_video,
+                context_actions=context_action,
+                context_chunk_ids=context_ids,
             )
             _accumulate_delta(
                 accum["delta_action"],
@@ -122,6 +149,9 @@ def evaluate_at_sigmas(
                 sigma_video=0.0,
                 sigma_action=sigma,
                 max_delta=dataset.max_delta,
+                context_video=context_video,
+                context_actions=context_action,
+                context_chunk_ids=context_ids,
             )
             _accumulate_delta(
                 accum["delta_video"],
@@ -136,6 +166,9 @@ def evaluate_at_sigmas(
                 sigma_video=sigma,
                 sigma_action=1.0,
                 max_delta=dataset.max_delta,
+                context_video=context_video,
+                context_actions=context_action,
+                context_chunk_ids=context_ids,
             )
             _accumulate_delta(
                 accum["delta_equal"],
@@ -150,6 +183,9 @@ def evaluate_at_sigmas(
                 sigma_video=sigma,
                 sigma_action=sigma,
                 max_delta=dataset.max_delta,
+                context_video=context_video,
+                context_actions=context_action,
+                context_chunk_ids=context_ids,
             )
         output["cursor_by_video_sigma_clean_action"].append(_finish_cursor(sigma, accum["cursor_video"]))
         output["delta_by_action_sigma_clean_video"].append(_finish_delta(sigma, accum["delta_action"]))
@@ -185,6 +221,9 @@ def _accumulate_cursor(
     sigma_video: float,
     sigma_action: float,
     dataset: NotePadHybridChunks,
+    context_video: torch.Tensor | None = None,
+    context_actions: torch.Tensor | None = None,
+    context_chunk_ids: torch.Tensor | None = None,
 ) -> None:
     b = video_input.shape[0]
     *_, cursor_pred = model.forward_all(
@@ -195,6 +234,9 @@ def _accumulate_cursor(
         torch.full((b,), sigma_video, device=video_input.device),
         torch.full((b,), sigma_action, device=video_input.device),
         chunk_ids,
+        context_video_patches=context_video,
+        context_actions=context_actions,
+        context_chunk_ids=context_chunk_ids,
     )
     pred_px = denormalize_positions(cursor_pred, dataset.width, dataset.height)
     true_px = denormalize_positions(positions, dataset.width, dataset.height)
@@ -217,6 +259,9 @@ def _accumulate_delta(
     sigma_video: float,
     sigma_action: float,
     max_delta: float,
+    context_video: torch.Tensor | None = None,
+    context_actions: torch.Tensor | None = None,
+    context_chunk_ids: torch.Tensor | None = None,
 ) -> None:
     b = video_input.shape[0]
     _, delta_velocity, dx_logits, dy_logits, *_ = model.forward_all(
@@ -227,6 +272,9 @@ def _accumulate_delta(
         torch.full((b,), sigma_video, device=video_input.device),
         torch.full((b,), sigma_action, device=video_input.device),
         chunk_ids,
+        context_video_patches=context_video,
+        context_actions=context_actions,
+        context_chunk_ids=context_chunk_ids,
     )
     flow_x0 = (delta_noise - delta_velocity).clamp(-1, 1) * max_delta
     ce_x0 = torch.stack(
@@ -274,7 +322,10 @@ def main() -> None:
     if args.device == "cuda" and not torch.cuda.is_available():
         raise SystemExit("CUDA requested but unavailable; pass --device cpu")
     device = torch.device(args.device)
-    model, config_payload, model_meta = load_model(args.run, device)
+    model, config_payload, model_meta = load_model(args.run, args.checkpoint, device)
+    run_args = config_payload.get("args", {})
+    if isinstance(run_args, dict):
+        setattr(model, "_wammo_context_chunks", int(run_args.get("context_chunks", 0)))
     dataset = make_dataset(config_payload, args)
     stratified = evaluate_at_sigmas(model, dataset, args.sigmas, device, args.batch_chunks, args.noise_seed)
     output = {
