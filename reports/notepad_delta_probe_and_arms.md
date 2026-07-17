@@ -78,3 +78,24 @@ Short 500-step representation screens, same 24x24 token grid:
 Read: coordinate channels are the only cheap input-side change that helped, and they helped a lot at the same token count. But they still did not approach the <=1 px probe gate in the short screen. The conv stem, as implemented here, is not worth promoting.
 
 Next implication: promote coordinate channels only as part of the next representation test, not directly to 100k. The next gate should be either a longer coordinate-channel hybrid run or a 2x2 patch screen. If coordinate channels plateau near 3 px after a longer run, the 4x token 2x2 patch path becomes the right next experiment.
+
+## MLP probe audit
+
+Runs:
+
+- Standard checkpoints: `runs/notepad-1k`, `runs/notepad-1k-hybrid`
+- Screen checkpoints: `runs/notepad-screen-linear`, `runs/notepad-screen-coord`, `runs/notepad-screen-conv`
+
+Probe: one hidden layer MLP, GELU, hidden size 256, same train/eval episode split and 1000 probe steps as the layer-sweep linear probes.
+
+| checkpoint | best linear layer | best linear position MAE px | best MLP layer | best MLP position MAE px |
+| --- | ---: | ---: | ---: | ---: |
+| `runs/notepad-1k` | 4 | 2.974 | 3 | 2.689 |
+| `runs/notepad-1k-hybrid` | 3 | 3.327 | 4 | 3.025 |
+| `runs/notepad-screen-linear` | 4 | 3.363 | 4 | 3.142 |
+| `runs/notepad-screen-coord` | 4 | 2.864 | 4 | 2.672 |
+| `runs/notepad-screen-conv` | 4 | 3.535 | 4 | 3.329 |
+
+Read: the MLP probe improves position decoding by a few tenths of a pixel, but it does not reveal hidden ~1px position information. The best result is still `2.672 px` on the coord-channel screen, essentially tied with the baseline checkpoint's `2.689 px`. The linear probe was pessimistic, but not qualitatively wrong.
+
+Decision: keep coord channels as a useful cheap improvement, but do not promote any current 4x4-patch configuration to 100k. The next representation test should be the sledgehammer screen: 2x2 patches, likely with a smaller width/depth budget to keep memory bounded. A separate cursor-size diagnostic is still useful: if a larger cursor solves the probe at 4x4 patches, it cleanly localizes the failure to sprite-scale-vs-patch-scale rather than the transformer.

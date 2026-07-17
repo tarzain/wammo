@@ -12,7 +12,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from wammo.eval.notepad_pixels import cursor_centroids
-from wammo.eval.probe_notepad import fit_linear_probe
+from wammo.eval.probe_notepad import fit_linear_probe, fit_mlp_probe
 from wammo.model.dit import MicroWAMConfig
 from wammo.model.flow import interpolate, velocity_target
 from wammo.model.tokenizer import patchify, patchify_with_coords
@@ -304,6 +304,7 @@ def probe_screen_model(
     device: torch.device,
     steps: int,
     lr: float,
+    mlp_hidden: int = 256,
 ) -> dict[str, object]:
     train_layers, train_pos, train_delta = extract_screen_layer_features(model, train_dataset, device)
     eval_layers, eval_pos, eval_delta = extract_screen_layer_features(model, eval_dataset, device)
@@ -311,9 +312,20 @@ def probe_screen_model(
     for layer_index, (train_x, eval_x) in enumerate(zip(train_layers, eval_layers, strict=True)):
         _, pos = fit_linear_probe(train_x, train_pos, eval_x, eval_pos, steps, lr, device)
         _, delta = fit_linear_probe(train_x, train_delta, eval_x, eval_delta, steps, lr, device)
-        layer_results.append({"layer": layer_index, "position_probe": pos, "delta_current_frame_probe": delta})
+        _, pos_mlp = fit_mlp_probe(train_x, train_pos, eval_x, eval_pos, steps, lr, device, hidden_dim=mlp_hidden)
+        _, delta_mlp = fit_mlp_probe(train_x, train_delta, eval_x, eval_delta, steps, lr, device, hidden_dim=mlp_hidden)
+        layer_results.append(
+            {
+                "layer": layer_index,
+                "position_probe": pos,
+                "delta_current_frame_probe": delta,
+                "position_mlp_probe": pos_mlp,
+                "delta_current_frame_mlp_probe": delta_mlp,
+            }
+        )
     best = min(layer_results, key=lambda item: item["position_probe"]["mae_mean"])
-    return {"best_layer": best, "layer_sweep": layer_results}
+    best_mlp = min(layer_results, key=lambda item: item["position_mlp_probe"]["mae_mean"])
+    return {"best_layer": best, "best_mlp_layer": best_mlp, "layer_sweep": layer_results}
 
 
 def parse_args() -> argparse.Namespace:
@@ -335,6 +347,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--delta-ce-weight", type=float, default=1.0)
     parser.add_argument("--cursor-weight", type=float, default=1.0)
     parser.add_argument("--probe-steps", type=int, default=1000)
+    parser.add_argument("--mlp-hidden", type=int, default=256)
     parser.add_argument("--generate-progress-every", type=int, default=100)
     return parser.parse_args()
 
@@ -395,7 +408,7 @@ def main() -> None:
                     f"delta={row['delta_loss']:.4f} delta_ce={row['delta_ce_loss']:.4f} cursor={row['cursor_loss']:.4f}"
                 )
     torch.save({"model": model.state_dict(), "config": asdict(config), "input_mode": args.input_mode}, args.out / "checkpoint.pt")
-    probe = probe_screen_model(model, train_dataset, eval_dataset, device, args.probe_steps, 1e-2)
+    probe = probe_screen_model(model, train_dataset, eval_dataset, device, args.probe_steps, 1e-2, mlp_hidden=args.mlp_hidden)
     output = {
         "model_kind": "notepad_representation_screen",
         "input_mode": args.input_mode,
