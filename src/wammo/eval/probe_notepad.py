@@ -86,6 +86,95 @@ def extract_features(
     return features[valid], positions_out[valid], deltas_out[valid]
 
 
+def encode_hidden_layers(
+    model: NotePadJointModel,
+    video_patches: torch.Tensor,
+    delta_actions: torch.Tensor,
+    button_ids: torch.Tensor,
+    key_ids: torch.Tensor,
+    sigma_video: torch.Tensor,
+    sigma_action: torch.Tensor,
+    chunk_ids: torch.Tensor,
+) -> list[torch.Tensor]:
+    b, c, p, d = video_patches.shape
+    if (c, p, d) != (model.config.chunk_frames, model.config.patches_per_frame, model.config.patch_dim):
+        raise ValueError(f"unexpected video patch shape {tuple(video_patches.shape)}")
+    chunk_tokens = model.chunk_pos(chunk_ids).unsqueeze(1)
+    video_tokens = model.video_in(video_patches).reshape(b, c * p, model.config.d_model)
+    action_tokens = model.delta_in(delta_actions) + model.button_in(button_ids) + model.key_in(key_ids)
+    video_tokens = video_tokens + model.video_pos + chunk_tokens + model.video_sigma(sigma_video.reshape(b, 1)).unsqueeze(1)
+    action_tokens = action_tokens + model.action_pos + chunk_tokens + model.action_sigma(sigma_action.reshape(b, 1)).unsqueeze(1)
+    hidden = torch.cat([video_tokens, action_tokens], dim=1)
+    layers = [hidden[:, : c * p].reshape(b, c, p, model.config.d_model)]
+    for layer in model.backbone.layers:
+        hidden = layer(hidden)
+        layers.append(hidden[:, : c * p].reshape(b, c, p, model.config.d_model))
+    if model.backbone.norm is not None:
+        hidden = model.backbone.norm(hidden)
+        layers.append(hidden[:, : c * p].reshape(b, c, p, model.config.d_model))
+    return layers
+
+
+@torch.no_grad()
+def extract_layer_features(
+    model: NotePadJointModel,
+    frames: np.ndarray,
+    actions: np.ndarray,
+    positions: np.ndarray,
+    device: torch.device,
+    batch_chunks: int = 64,
+) -> tuple[list[torch.Tensor], torch.Tensor, torch.Tensor]:
+    spec = load_spec()
+    episode_count, steps = frames.shape[:2]
+    chunk_frames = model.config.chunk_frames
+    frames_t = normalize_frames(frames.reshape(-1, *frames.shape[2:])).reshape(episode_count, steps, *frames.shape[2:])
+    actions_t = normalize_notepad_actions(
+        actions.reshape(-1, actions.shape[-1]),
+        float(spec["cursor"]["max_delta"]),
+        len(spec["keys"]),
+    ).reshape(episode_count, steps, actions.shape[-1])
+    video_chunks = frames_t.reshape(-1, chunk_frames, *frames_t.shape[2:])
+    action_chunks = torch.zeros_like(actions_t.reshape(-1, chunk_frames, actions_t.shape[-1]))
+    position_chunks = torch.as_tensor(positions.reshape(-1, chunk_frames, 2), dtype=torch.float32)
+    delta_chunks = torch.as_tensor(actions.reshape(-1, chunk_frames, actions.shape[-1])[..., 0:2], dtype=torch.float32)
+    chunk_ids = torch.arange(steps // chunk_frames).repeat(episode_count)
+
+    layer_parts: list[list[torch.Tensor]] | None = None
+    position_parts = []
+    delta_parts = []
+    for start in range(0, video_chunks.shape[0], batch_chunks):
+        end = start + batch_chunks
+        video = patchify(video_chunks[start:end]).to(device)
+        action = action_chunks[start:end].to(device)
+        ids = chunk_ids[start:end].to(device)
+        b = video.shape[0]
+        sigma_video = torch.zeros((b,), device=device)
+        sigma_action = torch.zeros((b,), device=device)
+        layers = encode_hidden_layers(
+            model,
+            video,
+            action[..., 0:2],
+            action[..., 2].long(),
+            action[..., 3].long(),
+            sigma_video,
+            sigma_action,
+            ids,
+        )
+        if layer_parts is None:
+            layer_parts = [[] for _ in layers]
+        for layer_index, layer_hidden in enumerate(layers):
+            frame_features = layer_hidden.mean(dim=2)
+            layer_parts[layer_index].append(frame_features.cpu().reshape(-1, frame_features.shape[-1]))
+        position_parts.append(position_chunks[start:end].reshape(-1, 2))
+        delta_parts.append(delta_chunks[start:end].reshape(-1, 2))
+    if layer_parts is None:
+        raise ValueError("no chunks available for layer feature extraction")
+    positions_out = torch.cat(position_parts)
+    deltas_out = torch.cat(delta_parts)
+    valid = torch.isfinite(positions_out).all(dim=-1)
+    return [torch.cat(parts)[valid] for parts in layer_parts], positions_out[valid], deltas_out[valid]
+
+
 @torch.no_grad()
 def extract_chunk_video_features(
     model: NotePadJointModel,
@@ -185,6 +274,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-seed", type=int, default=400_000)
     parser.add_argument("--steps", type=int, default=2000)
     parser.add_argument("--lr", type=float, default=1e-2)
+    parser.add_argument("--layer-sweep", action="store_true")
     return parser.parse_args()
 
 
@@ -197,6 +287,7 @@ def run_probe(
     eval_seed: int = 400_000,
     steps: int = 2000,
     lr: float = 1e-2,
+    layer_sweep: bool = False,
 ) -> dict[str, object]:
     model = load_model(run_dir, device)
     for parameter in model.parameters():
@@ -229,6 +320,23 @@ def run_probe(
         "delta_current_frame_probe": delta_current_metrics,
         "delta_visible_transition_probe": delta_visible_metrics,
     }
+    if layer_sweep:
+        train_layers, train_layer_pos, train_layer_delta = extract_layer_features(
+            model, train_frames, train_actions, train_positions, device
+        )
+        eval_layers, eval_layer_pos, eval_layer_delta = extract_layer_features(model, eval_frames, eval_actions, eval_positions, device)
+        layer_results = []
+        for layer_index, (layer_train, layer_eval) in enumerate(zip(train_layers, eval_layers, strict=True)):
+            _, layer_position = fit_linear_probe(layer_train, train_layer_pos, layer_eval, eval_layer_pos, steps, lr, device)
+            _, layer_delta = fit_linear_probe(layer_train, train_layer_delta, layer_eval, eval_layer_delta, steps, lr, device)
+            layer_results.append(
+                {
+                    "layer": layer_index,
+                    "position_probe": layer_position,
+                    "delta_current_frame_probe": layer_delta,
+                }
+            )
+        output["layer_sweep"] = layer_results
     out_dir = run_dir / "analysis"
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "linear_probe.json").write_text(json.dumps(output, indent=2) + "\n", encoding="utf-8")
@@ -249,6 +357,7 @@ def main() -> None:
         eval_seed=args.eval_seed,
         steps=args.steps,
         lr=args.lr,
+        layer_sweep=args.layer_sweep,
     )
     print(json.dumps(output, indent=2))
 

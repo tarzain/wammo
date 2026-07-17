@@ -48,3 +48,33 @@ Mechanism check: the standalone binned CE arm replaced the continuous delta velo
 Read: the hybrid is a real improvement over motion oversampling on in-stream delta prediction and keeps much stronger authority than CE-only, but it does not clear the acceptance bar. Cursor authority remains below the delta-weight arm (`1.09e-3` vs `1.76e-3`), CE inverse prediction remains worse than the standalone CE arm, and the frozen probe regresses from `2.912 px` to `3.252 px`. The auxiliary cursor-position readout learned its own supervised task somewhat, but did not make the trunk linearly encode cursor position at the desired precision.
 
 Next implication: do not launch 100k from this hybrid. The likely bottleneck is still spatial representation. The next cheap fork is either increasing cursor-position auxiliary weight substantially and probing again, or moving to 2x2 patches on a smaller model budget to test whether representation precision, not loss composition, is the hard blocker.
+
+## Layer sweep and input-side screens
+
+Runs:
+
+- Layer sweeps: `runs/notepad-1k`, `runs/notepad-1k-hybrid`
+- Short representation screens: `runs/notepad-screen-linear`, `runs/notepad-screen-coord`, `runs/notepad-screen-conv`
+
+Aux head check: the hybrid cursor-position head is `Linear(d_model, 2)` plus sigmoid output squashing, not an MLP. The probe regression is therefore not explained by a high-capacity nonlinear aux head hiding geometry outside the trunk.
+
+Layer sweep with 1000-step probes:
+
+| checkpoint | best layer | best position MAE px | final-layer position MAE px |
+| --- | ---: | ---: | ---: |
+| `runs/notepad-1k` | 4 | 2.990 | 2.990 |
+| `runs/notepad-1k-hybrid` | 4 | 3.329 | 3.329 |
+
+Read: the hybrid aux loss did not move a better representation to an earlier layer. It made every layer worse or flat relative to the baseline, so the failure is not a probe-at-the-wrong-layer artifact.
+
+Short 500-step representation screens, same 24x24 token grid:
+
+| screen | best layer | best position MAE px | read |
+| --- | ---: | ---: | --- |
+| linear control | 4 | 3.427 | short-run baseline |
+| coordinate channels | 4 | 2.950 | clear improvement over control, still above gate |
+| conv stem | 3 | 3.573 | worse than control |
+
+Read: coordinate channels are the only cheap input-side change that helped, and they helped a lot at the same token count. But they still did not approach the <=1 px probe gate in the short screen. The conv stem, as implemented here, is not worth promoting.
+
+Next implication: promote coordinate channels only as part of the next representation test, not directly to 100k. The next gate should be either a longer coordinate-channel hybrid run or a 2x2 patch screen. If coordinate channels plateau near 3 px after a longer run, the 4x token 2x2 patch path becomes the right next experiment.
