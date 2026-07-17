@@ -422,6 +422,7 @@ def evaluate_hybrid(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--episodes", type=int, default=1000)
+    parser.add_argument("--eval-episodes", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--eval-seed", type=int, default=100_000)
     parser.add_argument("--steps", type=int, default=3000)
@@ -431,6 +432,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out", type=Path, default=Path("runs/notepad-1k-hybrid"))
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ladder-every", type=int, default=500)
+    parser.add_argument("--checkpoint-every", type=int, default=0)
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--n-layers", type=int, default=4)
     parser.add_argument("--n-heads", type=int, default=4)
@@ -460,9 +462,11 @@ def main() -> None:
         args.episodes, args.seed, progress_every=args.generate_progress_every
     )
     train_dataset = NotePadHybridChunks(train_frames, train_actions, motion_oversample=True)
-    eval_dataset, eval_metadata = make_hybrid_eval_dataset(args.eval_seed)
-    _, legacy_eval_metadata = make_eval_dataset(args.eval_seed)
-    eval_metadata.update(legacy_eval_metadata)
+    eval_frames, eval_actions, eval_metadata = generate_training_dataset(args.eval_episodes, args.eval_seed, progress_every=0)
+    eval_dataset = NotePadHybridChunks(eval_frames, eval_actions, motion_oversample=False)
+    if args.eval_episodes == 1:
+        _, legacy_eval_metadata = make_eval_dataset(args.eval_seed)
+        eval_metadata.update(legacy_eval_metadata)
 
     config = MicroWAMConfig(
         d_model=args.d_model,
@@ -555,6 +559,17 @@ def main() -> None:
                     f"cursor={row['eval_cursor_pos_mae_px']:.3f}px click={row['eval_click_accuracy']:.3f} "
                     f"key={row['eval_key_accuracy']:.3f}"
                 )
+                if args.checkpoint_every > 0 and (step % args.checkpoint_every == 0 or step == args.steps):
+                    torch.save(
+                        {
+                            "model": model.state_dict(),
+                            "config": asdict(config),
+                            "model_kind": "notepad_hybrid",
+                            "head_sigma_conditioned": args.head_sigma_conditioned,
+                            "step": step,
+                        },
+                        args.out / f"checkpoint_step_{step}.pt",
+                    )
 
     torch.save(
         {
