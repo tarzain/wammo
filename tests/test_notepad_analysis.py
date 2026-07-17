@@ -8,6 +8,7 @@ from wammo.eval.analyze_notepad_run import (
     delta_prediction_diagnostic,
     summarize_samples,
 )
+from wammo.eval.notepad_pixels import cursor_positions_from_actions
 
 
 def test_delta_baselines_zero_and_mean():
@@ -50,3 +51,12 @@ def test_cursor_centroids_extracts_cursor_pixels():
     frames[0, 0, 10, 20] = [245, 245, 245]
     positions = cursor_centroids(frames)
     np.testing.assert_allclose(positions[0, 0], [20, 10])
+
+
+def test_cursor_positions_from_actions_matches_step_semantics():
+    actions = np.zeros((1, 2, 4), dtype=np.float32)
+    actions[0, 0, 0:2] = [8, -8]
+    actions[0, 1, 0:2] = [-4, 4]
+    positions = cursor_positions_from_actions(actions)
+    np.testing.assert_allclose(positions[0, 0], [56, 40])
+    np.testing.assert_allclose(positions[0, 1], [52, 44])

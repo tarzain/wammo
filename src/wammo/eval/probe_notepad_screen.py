@@ -23,6 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     parser.add_argument("--probe-steps", type=int, default=1000)
     parser.add_argument("--mlp-hidden", type=int, default=256)
+    parser.add_argument("--pooling", choices=["mean", "spatial"], default="spatial")
     return parser.parse_args()
 
 
@@ -35,20 +36,43 @@ def main() -> None:
     checkpoint = torch.load(args.run / "checkpoint.pt", map_location=device)
     config = MicroWAMConfig(**checkpoint["config"])
     input_mode = checkpoint["input_mode"]
-    model = RepresentationScreenModel(config, key_count=len(load_spec()["keys"]), input_mode=input_mode).to(device)
+    patch_size = int(checkpoint.get("patch_size", 4))
+    model = RepresentationScreenModel(config, key_count=len(load_spec()["keys"]), input_mode=input_mode, patch_size=patch_size).to(device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
     for parameter in model.parameters():
         parameter.requires_grad_(False)
     run_args = summary["args"]
-    train_frames, train_actions, _ = generate_training_dataset(run_args["episodes"], run_args["seed"], progress_every=0)
-    eval_frames, eval_actions, _ = generate_training_dataset(run_args["eval_episodes"], run_args["eval_seed"], progress_every=0)
+    cursor_size = run_args.get("cursor_size")
+    train_frames, train_actions, _ = generate_training_dataset(
+        run_args["episodes"],
+        run_args["seed"],
+        progress_every=0,
+        cursor_size=cursor_size,
+    )
+    eval_frames, eval_actions, _ = generate_training_dataset(
+        run_args["eval_episodes"],
+        run_args["eval_seed"],
+        progress_every=0,
+        cursor_size=cursor_size,
+    )
     train_dataset = RepresentationScreenDataset(train_frames, train_actions)
     eval_dataset = RepresentationScreenDataset(eval_frames, eval_actions, motion_oversample=False)
-    probe = probe_screen_model(model, train_dataset, eval_dataset, device, args.probe_steps, 1e-2, mlp_hidden=args.mlp_hidden)
+    probe = probe_screen_model(
+        model,
+        train_dataset,
+        eval_dataset,
+        device,
+        args.probe_steps,
+        1e-2,
+        mlp_hidden=args.mlp_hidden,
+        pooling=args.pooling,
+    )
     output = {
         "run": str(args.run),
         "input_mode": input_mode,
+        "patch_size": patch_size,
+        "cursor_size": cursor_size,
         "model": asdict(config),
         "probe": probe,
     }

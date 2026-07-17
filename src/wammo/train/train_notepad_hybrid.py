@@ -12,7 +12,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from wammo.eval.divergence_ladder import notepad_divergence_ladder
-from wammo.eval.notepad_pixels import cursor_centroids
+from wammo.eval.notepad_pixels import cursor_positions_from_actions
 from wammo.model.dit import MicroWAMConfig
 from wammo.model.flow import euler_step_toward_data, interpolate, velocity_target
 from wammo.model.tokenizer import patchify
@@ -90,7 +90,7 @@ class NotePadHybridChunks:
             raise ValueError("episode length must be divisible by chunk_frames")
         self.frames = frames
         self.actions = actions
-        self.positions = cursor_centroids(frames)
+        self.positions = cursor_positions_from_actions(actions)
         self.chunk_frames = chunk_frames
         self.chunks_per_episode = frames.shape[1] // chunk_frames
         self.motion_oversample = motion_oversample

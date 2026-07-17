@@ -99,3 +99,28 @@ Probe: one hidden layer MLP, GELU, hidden size 256, same train/eval episode spli
 Read: the MLP probe improves position decoding by a few tenths of a pixel, but it does not reveal hidden ~1px position information. The best result is still `2.672 px` on the coord-channel screen, essentially tied with the baseline checkpoint's `2.689 px`. The linear probe was pessimistic, but not qualitatively wrong.
 
 Decision: keep coord channels as a useful cheap improvement, but do not promote any current 4x4-patch configuration to 100k. The next representation test should be the sledgehammer screen: 2x2 patches, likely with a smaller width/depth budget to keep memory bounded. A separate cursor-size diagnostic is still useful: if a larger cursor solves the probe at 4x4 patches, it cleanly localizes the failure to sprite-scale-vs-patch-scale rather than the transformer.
+
+## Probe label correction and cursor-size diagnostic
+
+Important correction: the earlier position probes used `cursor_centroids(frames)` as labels. That pixel heuristic is badly contaminated by other near-white UI pixels such as toolbar glyphs and focus rings. Against exact cursor positions reconstructed from action integration, the centroid labels have very large error:
+
+| cursor size | centroid-vs-true mean abs error px | p95 euclidean error px |
+| ---: | ---: | ---: |
+| 5 | 22.345 | 54.269 |
+| 9 | 19.473 | 46.646 |
+
+All future position probes and cursor auxiliary losses now use exact cursor positions from actions, not pixel centroids. This invalidates the absolute interpretation of the previous `~3 px` position-probe numbers. The delta probes and ladder metrics are unaffected.
+
+True-label probes:
+
+| run | pooling | best linear position MAE px | best MLP position MAE px | note |
+| --- | --- | ---: | ---: | --- |
+| `runs/notepad-1k` | mean | 12.703 | 11.384 | old checkpoint, no cursor aux |
+| `runs/notepad-screen-coord-true` | mean | 12.917 | 11.695 | trained with exact cursor labels |
+| `runs/notepad-screen-coord-cursor9-true` | mean | 12.860 | 11.818 | larger cursor does not help |
+| `runs/notepad-screen-2x2-coord` | mean | 15.664 | 14.105 | reduced 2x2 screen, undertrained/small |
+| `runs/notepad-screen-coord-true` | spatial moments | 9.455 | 7.326 | better probe pooling, still far from gate |
+
+Read: making the cursor larger is possible, but in this diagnostic it does not solve the representation problem. The bigger finding is that mean-pooled probes were the wrong instrument for absolute position because they discard patch layout. Spatial-moment pooling is better and should replace mean pooling for future position probes, but even it does not reveal <=1 px cursor position in the current 4x4 coord model.
+
+Decision update: the current evidence no longer supports a clean "3 px within-patch floor" story. The old 3 px floor was partly a bad label/probe artifact. With exact labels, the model is much worse at absolute cursor position. Next work should focus on a position-aware architecture or probe path, not only patch size: e.g. patch-level heatmap/objectness supervision, CLS/query token cross-attention to patch tokens, or a flattened/sparse patch-token probe that preserves layout more completely than spatial moments.

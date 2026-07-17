@@ -12,7 +12,7 @@ import torch.nn.functional as F
 
 from wammo.data.notepad import generate_episode
 from wammo.eval.analyze_notepad_run import load_model
-from wammo.eval.notepad_pixels import cursor_centroids
+from wammo.eval.notepad_pixels import cursor_positions_from_actions
 from wammo.model.tokenizer import patchify
 from wammo.notepad_desk import load_spec
 from wammo.train.overfit_notepad_one import NotePadJointModel, normalize_notepad_actions
@@ -27,8 +27,24 @@ def make_probe_arrays(episodes: int, seed: int) -> tuple[np.ndarray, np.ndarray,
         actions.append(ep_actions)
     frames_np = np.stack(frames)
     actions_np = np.stack(actions)
-    positions = cursor_centroids(frames_np)
+    positions = cursor_positions_from_actions(actions_np)
     return frames_np, actions_np, positions
+
+
+def frame_features_from_hidden(hidden: torch.Tensor, pooling: str = "spatial") -> torch.Tensor:
+    if pooling == "mean":
+        return hidden.mean(dim=2)
+    if pooling != "spatial":
+        raise ValueError(f"unknown pooling mode {pooling}")
+    p = hidden.shape[2]
+    side = int(p**0.5)
+    if side * side != p:
+        raise ValueError(f"patch count must be square for spatial pooling, got {p}")
+    coords = torch.linspace(-1.0, 1.0, side, device=hidden.device, dtype=hidden.dtype)
+    yy, xx = torch.meshgrid(coords, coords, indexing="ij")
+    xw = xx.reshape(1, 1, p, 1)
+    yw = yy.reshape(1, 1, p, 1)
+    return torch.cat([hidden.mean(dim=2), (hidden * xw).mean(dim=2), (hidden * yw).mean(dim=2)], dim=-1)
 
 
 @torch.no_grad()
@@ -39,6 +55,7 @@ def extract_features(
     positions: np.ndarray,
     device: torch.device,
     batch_chunks: int = 64,
+    pooling: str = "spatial",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     spec = load_spec()
     episode_count, steps = frames.shape[:2]
@@ -75,7 +92,7 @@ def extract_features(
             sigma_action,
             ids,
         )
-        frame_features = video_hidden.mean(dim=2)
+        frame_features = frame_features_from_hidden(video_hidden, pooling=pooling)
         feature_parts.append(frame_features.cpu().reshape(-1, frame_features.shape[-1]))
         position_parts.append(position_chunks[start:end].reshape(-1, 2))
         delta_parts.append(delta_chunks[start:end].reshape(-1, 2))
@@ -123,6 +140,7 @@ def extract_layer_features(
     positions: np.ndarray,
     device: torch.device,
     batch_chunks: int = 64,
+    pooling: str = "spatial",
 ) -> tuple[list[torch.Tensor], torch.Tensor, torch.Tensor]:
     spec = load_spec()
     episode_count, steps = frames.shape[:2]
@@ -163,7 +181,7 @@ def extract_layer_features(
         if layer_parts is None:
             layer_parts = [[] for _ in layers]
         for layer_index, layer_hidden in enumerate(layers):
-            frame_features = layer_hidden.mean(dim=2)
+            frame_features = frame_features_from_hidden(layer_hidden, pooling=pooling)
             layer_parts[layer_index].append(frame_features.cpu().reshape(-1, frame_features.shape[-1]))
         position_parts.append(position_chunks[start:end].reshape(-1, 2))
         delta_parts.append(delta_chunks[start:end].reshape(-1, 2))
@@ -182,6 +200,7 @@ def extract_chunk_video_features(
     actions: np.ndarray,
     device: torch.device,
     batch_chunks: int = 64,
+    pooling: str = "spatial",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     spec = load_spec()
     episode_count, steps = frames.shape[:2]
@@ -216,7 +235,7 @@ def extract_chunk_video_features(
             sigma_action,
             ids,
         )
-        feature_parts.append(video_hidden.mean(dim=2).cpu())
+        feature_parts.append(frame_features_from_hidden(video_hidden, pooling=pooling).cpu())
         delta_parts.append(delta_chunks[start:end])
     return torch.cat(feature_parts), torch.cat(delta_parts)
 
@@ -320,6 +339,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layer-sweep", action="store_true")
     parser.add_argument("--mlp-probe", action="store_true")
     parser.add_argument("--mlp-hidden", type=int, default=256)
+    parser.add_argument("--pooling", choices=["mean", "spatial"], default="spatial")
     return parser.parse_args()
 
 
@@ -335,16 +355,17 @@ def run_probe(
     layer_sweep: bool = False,
     mlp_probe: bool = False,
     mlp_hidden: int = 256,
+    pooling: str = "spatial",
 ) -> dict[str, object]:
     model = load_model(run_dir, device)
     for parameter in model.parameters():
         parameter.requires_grad_(False)
     train_frames, train_actions, train_positions = make_probe_arrays(train_episodes, train_seed)
     eval_frames, eval_actions, eval_positions = make_probe_arrays(eval_episodes, eval_seed)
-    x_train, pos_train, delta_train = extract_features(model, train_frames, train_actions, train_positions, device)
-    x_eval, pos_eval, delta_eval = extract_features(model, eval_frames, eval_actions, eval_positions, device)
-    chunk_x_train, chunk_delta_train = extract_chunk_video_features(model, train_frames, train_actions, device)
-    chunk_x_eval, chunk_delta_eval = extract_chunk_video_features(model, eval_frames, eval_actions, device)
+    x_train, pos_train, delta_train = extract_features(model, train_frames, train_actions, train_positions, device, pooling=pooling)
+    x_eval, pos_eval, delta_eval = extract_features(model, eval_frames, eval_actions, eval_positions, device, pooling=pooling)
+    chunk_x_train, chunk_delta_train = extract_chunk_video_features(model, train_frames, train_actions, device, pooling=pooling)
+    chunk_x_eval, chunk_delta_eval = extract_chunk_video_features(model, eval_frames, eval_actions, device, pooling=pooling)
     visible_delta_x_train, visible_delta_y_train = visible_delta_features(chunk_x_train, chunk_delta_train)
     visible_delta_x_eval, visible_delta_y_eval = visible_delta_features(chunk_x_eval, chunk_delta_eval)
     _, position_metrics = fit_linear_probe(x_train, pos_train, x_eval, pos_eval, steps, lr, device)
@@ -363,6 +384,7 @@ def run_probe(
         "model": asdict(model.config),
         "train_examples": int(x_train.shape[0]),
         "eval_examples": int(x_eval.shape[0]),
+        "pooling": pooling,
         "position_probe": position_metrics,
         "delta_current_frame_probe": delta_current_metrics,
         "delta_visible_transition_probe": delta_visible_metrics,
@@ -394,9 +416,16 @@ def run_probe(
         output["delta_visible_transition_mlp_probe"] = delta_visible_mlp
     if layer_sweep:
         train_layers, train_layer_pos, train_layer_delta = extract_layer_features(
-            model, train_frames, train_actions, train_positions, device
+            model, train_frames, train_actions, train_positions, device, pooling=pooling
         )
-        eval_layers, eval_layer_pos, eval_layer_delta = extract_layer_features(model, eval_frames, eval_actions, eval_positions, device)
+        eval_layers, eval_layer_pos, eval_layer_delta = extract_layer_features(
+            model,
+            eval_frames,
+            eval_actions,
+            eval_positions,
+            device,
+            pooling=pooling,
+        )
         layer_results = []
         for layer_index, (layer_train, layer_eval) in enumerate(zip(train_layers, eval_layers, strict=True)):
             _, layer_position = fit_linear_probe(layer_train, train_layer_pos, layer_eval, eval_layer_pos, steps, lr, device)
@@ -454,6 +483,7 @@ def main() -> None:
         layer_sweep=args.layer_sweep,
         mlp_probe=args.mlp_probe,
         mlp_hidden=args.mlp_hidden,
+        pooling=args.pooling,
     )
     print(json.dumps(output, indent=2))
 

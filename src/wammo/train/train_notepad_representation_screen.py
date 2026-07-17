@@ -11,8 +11,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from wammo.eval.notepad_pixels import cursor_centroids
-from wammo.eval.probe_notepad import fit_linear_probe, fit_mlp_probe
+from wammo.eval.notepad_pixels import cursor_positions_from_actions
+from wammo.eval.probe_notepad import fit_linear_probe, fit_mlp_probe, frame_features_from_hidden
 from wammo.model.dit import MicroWAMConfig
 from wammo.model.flow import interpolate, velocity_target
 from wammo.model.tokenizer import patchify, patchify_with_coords
@@ -25,10 +25,16 @@ from wammo.train.train_notepad_hybrid import normalize_positions
 
 
 class RepresentationScreenDataset:
-    def __init__(self, frames: np.ndarray, actions: np.ndarray, chunk_frames: int = 4, motion_oversample: bool = True):
+    def __init__(
+        self,
+        frames: np.ndarray,
+        actions: np.ndarray,
+        chunk_frames: int = 4,
+        motion_oversample: bool = True,
+    ):
         self.frames = frames
         self.actions = actions
-        self.positions = cursor_centroids(frames)
+        self.positions = cursor_positions_from_actions(actions)
         self.chunk_frames = chunk_frames
         self.chunks_per_episode = frames.shape[1] // chunk_frames
         self.motion_oversample = motion_oversample
@@ -102,15 +108,18 @@ class ConvPatchStem(nn.Module):
 
 
 class RepresentationScreenModel(nn.Module):
-    def __init__(self, config: MicroWAMConfig, key_count: int, input_mode: str):
+    def __init__(self, config: MicroWAMConfig, key_count: int, input_mode: str, patch_size: int = 4):
         super().__init__()
         self.config = config
         self.key_count = key_count
         self.input_mode = input_mode
+        self.patch_size = patch_size
+        self.patch_dim = 3 * patch_size * patch_size
+        self.coord_patch_dim = 5 * patch_size * patch_size
         if input_mode == "linear":
-            self.video_in = nn.Linear(48, config.d_model)
+            self.video_in = nn.Linear(self.patch_dim, config.d_model)
         elif input_mode == "coord":
-            self.video_in = nn.Linear(80, config.d_model)
+            self.video_in = nn.Linear(self.coord_patch_dim, config.d_model)
         elif input_mode == "conv":
             self.video_in = ConvPatchStem(config.d_model)
         else:
@@ -118,7 +127,7 @@ class RepresentationScreenModel(nn.Module):
         self.delta_in = nn.Linear(2, config.d_model)
         self.button_in = nn.Embedding(3, config.d_model)
         self.key_in = nn.Embedding(key_count + 1, config.d_model)
-        self.video_out = nn.Linear(config.d_model, 48)
+        self.video_out = nn.Linear(config.d_model, self.patch_dim)
         self.delta_out = nn.Linear(config.d_model, 2)
         self.dx_out = nn.Linear(config.d_model, DELTA_BINS)
         self.dy_out = nn.Linear(config.d_model, DELTA_BINS)
@@ -142,9 +151,9 @@ class RepresentationScreenModel(nn.Module):
 
     def video_tokens(self, frames: torch.Tensor) -> torch.Tensor:
         if self.input_mode == "linear":
-            return self.video_in(patchify(frames)).reshape(frames.shape[0], -1, self.config.d_model)
+            return self.video_in(patchify(frames, patch_size=self.patch_size)).reshape(frames.shape[0], -1, self.config.d_model)
         if self.input_mode == "coord":
-            return self.video_in(patchify_with_coords(frames)).reshape(frames.shape[0], -1, self.config.d_model)
+            return self.video_in(patchify_with_coords(frames, patch_size=self.patch_size)).reshape(frames.shape[0], -1, self.config.d_model)
         return self.video_in(frames)
 
     def encode(
@@ -227,7 +236,7 @@ def screen_training_step(
     t_action = torch.rand((b,), device=video_clean.device, generator=generator)
     video_noisy = interpolate(video_clean, video_noise, t_video)
     delta_noisy = interpolate(delta_clean, delta_noise, t_action)
-    video_target = velocity_target(patchify(video_clean), patchify(video_noise))
+    video_target = velocity_target(patchify(video_clean, patch_size=model.patch_size), patchify(video_noise, patch_size=model.patch_size))
     delta_target = velocity_target(delta_clean, delta_noise)
     video_pred, delta_pred, dx_logits, dy_logits, button_logits, key_logits, cursor_pred = model.forward_all(
         video_noisy, delta_noisy, button_target, key_target, t_video, t_action, chunk_ids
@@ -259,6 +268,7 @@ def extract_screen_layer_features(
     dataset: RepresentationScreenDataset,
     device: torch.device,
     batch_chunks: int = 64,
+    pooling: str = "spatial",
 ) -> tuple[list[torch.Tensor], torch.Tensor, torch.Tensor]:
     video_all, actions_all, _, chunk_ids_all = dataset.all_chunks(torch.device("cpu"))
     layer_parts: list[list[torch.Tensor]] | None = None
@@ -283,7 +293,8 @@ def extract_screen_layer_features(
         if layer_parts is None:
             layer_parts = [[] for _ in layers]
         for layer_index, layer in enumerate(layers):
-            layer_parts[layer_index].append(layer.mean(dim=2).cpu().reshape(-1, layer.shape[-1]))
+            features = frame_features_from_hidden(layer, pooling=pooling)
+            layer_parts[layer_index].append(features.cpu().reshape(-1, features.shape[-1]))
     if layer_parts is None:
         raise ValueError("no chunks available for screen probe")
     positions_out = dataset.positions.reshape(-1, 2)
@@ -305,9 +316,23 @@ def probe_screen_model(
     steps: int,
     lr: float,
     mlp_hidden: int = 256,
+    batch_chunks: int = 64,
+    pooling: str = "spatial",
 ) -> dict[str, object]:
-    train_layers, train_pos, train_delta = extract_screen_layer_features(model, train_dataset, device)
-    eval_layers, eval_pos, eval_delta = extract_screen_layer_features(model, eval_dataset, device)
+    train_layers, train_pos, train_delta = extract_screen_layer_features(
+        model,
+        train_dataset,
+        device,
+        batch_chunks=batch_chunks,
+        pooling=pooling,
+    )
+    eval_layers, eval_pos, eval_delta = extract_screen_layer_features(
+        model,
+        eval_dataset,
+        device,
+        batch_chunks=batch_chunks,
+        pooling=pooling,
+    )
     layer_results = []
     for layer_index, (train_x, eval_x) in enumerate(zip(train_layers, eval_layers, strict=True)):
         _, pos = fit_linear_probe(train_x, train_pos, eval_x, eval_pos, steps, lr, device)
@@ -325,7 +350,7 @@ def probe_screen_model(
         )
     best = min(layer_results, key=lambda item: item["position_probe"]["mae_mean"])
     best_mlp = min(layer_results, key=lambda item: item["position_mlp_probe"]["mae_mean"])
-    return {"best_layer": best, "best_mlp_layer": best_mlp, "layer_sweep": layer_results}
+    return {"pooling": pooling, "best_layer": best, "best_mlp_layer": best_mlp, "layer_sweep": layer_results}
 
 
 def parse_args() -> argparse.Namespace:
@@ -347,7 +372,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--delta-ce-weight", type=float, default=1.0)
     parser.add_argument("--cursor-weight", type=float, default=1.0)
     parser.add_argument("--probe-steps", type=int, default=1000)
+    parser.add_argument("--probe-batch-chunks", type=int, default=64)
     parser.add_argument("--mlp-hidden", type=int, default=256)
+    parser.add_argument("--pooling", choices=["mean", "spatial"], default="spatial")
+    parser.add_argument("--patch-size", type=int, default=4)
+    parser.add_argument("--cursor-size", type=int, default=None)
     parser.add_argument("--generate-progress-every", type=int, default=100)
     return parser.parse_args()
 
@@ -361,9 +390,17 @@ def main() -> None:
     sample_generator = torch.Generator().manual_seed(args.seed)
     noise_generator = torch.Generator(device=device).manual_seed(args.seed)
     train_frames, train_actions, train_metadata = generate_training_dataset(
-        args.episodes, args.seed, progress_every=args.generate_progress_every
+        args.episodes,
+        args.seed,
+        progress_every=args.generate_progress_every,
+        cursor_size=args.cursor_size,
     )
-    eval_frames, eval_actions, eval_metadata = generate_training_dataset(args.eval_episodes, args.eval_seed, progress_every=0)
+    eval_frames, eval_actions, eval_metadata = generate_training_dataset(
+        args.eval_episodes,
+        args.eval_seed,
+        progress_every=0,
+        cursor_size=args.cursor_size,
+    )
     train_dataset = RepresentationScreenDataset(train_frames, train_actions)
     eval_dataset = RepresentationScreenDataset(eval_frames, eval_actions, motion_oversample=False)
     config = MicroWAMConfig(
@@ -371,10 +408,11 @@ def main() -> None:
         n_layers=args.n_layers,
         n_heads=args.n_heads,
         action_dim=4,
-        patches_per_frame=24 * 24,
+        patch_dim=3 * args.patch_size * args.patch_size,
+        patches_per_frame=(96 // args.patch_size) * (96 // args.patch_size),
         max_chunks=16,
     )
-    model = RepresentationScreenModel(config, key_count=len(load_spec()["keys"]), input_mode=args.input_mode).to(device)
+    model = RepresentationScreenModel(config, key_count=len(load_spec()["keys"]), input_mode=args.input_mode, patch_size=args.patch_size).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     args.out.mkdir(parents=True, exist_ok=True)
     start = time.time()
@@ -407,8 +445,21 @@ def main() -> None:
                     f"step={step} loss={row['loss']:.4f} video={row['video_loss']:.4f} "
                     f"delta={row['delta_loss']:.4f} delta_ce={row['delta_ce_loss']:.4f} cursor={row['cursor_loss']:.4f}"
                 )
-    torch.save({"model": model.state_dict(), "config": asdict(config), "input_mode": args.input_mode}, args.out / "checkpoint.pt")
-    probe = probe_screen_model(model, train_dataset, eval_dataset, device, args.probe_steps, 1e-2, mlp_hidden=args.mlp_hidden)
+    torch.save(
+        {"model": model.state_dict(), "config": asdict(config), "input_mode": args.input_mode, "patch_size": args.patch_size},
+        args.out / "checkpoint.pt",
+    )
+    probe = probe_screen_model(
+        model,
+        train_dataset,
+        eval_dataset,
+        device,
+        args.probe_steps,
+        1e-2,
+        mlp_hidden=args.mlp_hidden,
+        batch_chunks=args.probe_batch_chunks,
+        pooling=args.pooling,
+    )
     output = {
         "model_kind": "notepad_representation_screen",
         "input_mode": args.input_mode,

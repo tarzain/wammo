@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 
-from wammo.train.train_notepad import NotePadMultiEpisodeChunks, make_eval_dataset
+from wammo.train.train_notepad import NotePadMultiEpisodeChunks, generate_training_dataset, make_eval_dataset
 
 
 def test_multi_episode_sampler_shapes():
@@ -32,3 +32,10 @@ def test_eval_dataset_shapes():
     assert action.shape == (16, 4, 4)
     assert chunk_ids.shape == (16,)
     assert metadata["eval_rare_event_rate"] >= 0.15
+
+
+def test_generate_training_dataset_cursor_size_override():
+    frames, actions, metadata = generate_training_dataset(1, 123, progress_every=0, cursor_size=9)
+    assert frames.shape == (1, 64, 96, 96, 3)
+    assert actions.shape == (1, 64, 4)
+    assert metadata["cursor_size"] == 9

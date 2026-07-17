@@ -77,7 +77,12 @@ class NotePadMultiEpisodeChunks:
         return np.asarray(pairs, dtype=np.int64)
 
 
-def generate_training_dataset(episodes: int, seed: int, progress_every: int = 100) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
+def generate_training_dataset(
+    episodes: int,
+    seed: int,
+    progress_every: int = 100,
+    cursor_size: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
     spec = load_spec()
     steps = int(spec["episode_steps"])
     width = int(spec["canvas"]["width"])
@@ -86,7 +91,7 @@ def generate_training_dataset(episodes: int, seed: int, progress_every: int = 10
     actions = np.empty((episodes, steps, 4), dtype=np.float32)
     start = time.time()
     for i in range(episodes):
-        ep_frames, ep_actions = generate_episode(seed + i)
+        ep_frames, ep_actions = generate_episode(seed + i, cursor_size=cursor_size)
         frames[i] = ep_frames
         actions[i] = ep_actions
         if progress_every > 0 and (i + 1 == 1 or (i + 1) % progress_every == 0 or i + 1 == episodes):
@@ -97,6 +102,7 @@ def generate_training_dataset(episodes: int, seed: int, progress_every: int = 10
         "rare_event_rate": rare_event_rate(actions),
         "frames_shape": list(frames.shape),
         "actions_shape": list(actions.shape),
+        "cursor_size": cursor_size if cursor_size is not None else int(spec["cursor"]["size"]),
     }
     return frames, actions, metadata
 
