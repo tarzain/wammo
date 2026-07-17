@@ -19,6 +19,11 @@ dev = [
   "pytest>=8.0",
   "ruff>=0.6",
 ]
+onnx = [
+  "onnx>=1.16",
+  "onnxruntime>=1.18",
+  "onnxscript>=0.1",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -28,4 +33,3 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
-

@@ -79,3 +79,34 @@ python -m wammo.train.train_notepad \
   --ladder-every 500 \
   --out runs/notepad-1k
 ```
+
+## ONNX Export
+
+Install export dependencies in the shared environment:
+
+```bash
+source /venv/main/bin/activate
+uv pip install -e ".[onnx]"
+```
+
+Export one NotePad hybrid checkpoint and validate it with ONNX Runtime:
+
+```bash
+python -m wammo.export.onnx_notepad_hybrid \
+  --run runs/notepad-long-corner-sigma-context \
+  --checkpoint runs/notepad-long-corner-sigma-context/checkpoint_step_85000.pt \
+  --out runs/notepad-long-corner-sigma-context/onnx/checkpoint_step_85000.onnx
+```
+
+The exporter writes a single `.onnx` file plus a JSON sidecar with input/output names, model config, checkpoint step, opset, and ONNX Runtime parity metrics. The exported graph takes normalized patch/action tensors directly:
+
+- inputs: `video_patches`, `delta_actions`, `button_ids`, `key_ids`, `sigma_video`, `sigma_action`, `chunk_ids`, `context_video_patches`, `context_actions`, `context_chunk_ids`
+- outputs: `video_velocity`, `delta_velocity`, `dx_logits`, `dy_logits`, `button_logits`, `key_logits`, `cursor_xy_norm`
+
+Bulk export saved step checkpoints:
+
+```bash
+python -m wammo.export.onnx_notepad_hybrid \
+  --run runs/notepad-long-corner-sigma-context \
+  --checkpoint-glob "checkpoint_step_*.pt"
+```
