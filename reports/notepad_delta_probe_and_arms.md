@@ -194,3 +194,23 @@ Same hybrid σ stratifier, 64 eval episodes:
 Read: the intervention moved the intended leak metric, but only modestly. Fully-noisy-action CE inverse dynamics improved from `4.755 px` to `4.531 px`, so corner pressure helped. It did not solve the problem: the head still performs close to the trivial motion baseline when action tokens carry no self-information. The flow path did not improve on the same corner. Cursor coordinate prediction and ladder authority both improved, suggesting σ-conditioned readouts/corner training are useful, but not sufficient to force video-grounded inverse dynamics.
 
 Decision: keep the corner-weighted σ sampler and σ-conditioned heads as positive infrastructure, but do not launch 100k from this arm. The next narrow test should remove the action-token shortcut more aggressively for inverse losses: train a dedicated masked-action inverse arm where `δ_input` is always null/noise for the CE head while video is clean or lightly noised. If that beats the `4.53 px` noisy-action number, the failure was shortcut competition; if it does not, the missing computation is temporal video differencing inside the trunk.
+
+## Pure inverse and frame-difference channels
+
+Runs:
+
+- `runs/notepad-1k-pure-inverse-coord`
+- `runs/notepad-1k-pure-inverse-coord-diff`
+
+Change: train a dedicated video-only inverse model. It has no delta/action-token input path, only video patch tokens plus learned per-frame query tokens that predict binned dx/dy. The first frame in each chunk is masked from the inverse loss/eval so the metric only covers visible within-chunk transitions. The frame-difference arm appends signed `x_t - x_{t-1}` RGB channels alongside coordinate channels.
+
+Both runs use 1000 episodes, 3000 steps, batch size 4, 4x4 patches, and the same 64-episode eval split. The visible-transition motion zero baseline is `5.314 px`.
+
+| run | input | motion delta MAE px | margin vs zero px | pred abs mean px | visible delta MAE px |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `runs/notepad-1k-pure-inverse-coord` | coord | 3.911 | 1.403 | 4.097 | 3.530 |
+| `runs/notepad-1k-pure-inverse-coord-diff` | coord + frame diff | 1.857 | 3.457 | 4.905 | 2.016 |
+
+Read: the pure inverse arm cleanly beats the noisy-action hybrid metric, so video-grounded inverse dynamics is learnable once the action-token shortcut is removed. More importantly, frame-difference channels are a large win: they cut motion MAE by another `2.05 px` and bring predicted motion magnitude close to the true scale. This means the representation ceiling is not simply "absolute cursor position is too coarse"; delta needs relative motion information, and explicit frame differences make that information linearly/local-token visible enough for the small transformer.
+
+Decision update: promote frame-difference channels into the next joint/hybrid run before paying for 2x2 patches. The next candidate should combine the useful infrastructure: coord+diff video input, continuous in-stream deltas, σ-conditioned heads, corner-weighted σ sampling, and a pure-inverse auxiliary loss where the CE dx/dy head sees masked/noisy action tokens. If that preserves ladder authority while keeping noisy-action inverse MAE near the `1.86 px` pure-inverse result, it becomes the first serious 100k candidate.
