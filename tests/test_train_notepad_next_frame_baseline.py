@@ -53,3 +53,13 @@ def test_baseline_step_is_finite_and_reports_changed_pixels():
     assert torch.isfinite(loss)
     assert metrics["changed_pixel_rate"] > 0
     assert metrics["changed_mae"] > 0
+
+
+def test_residual_baseline_starts_as_copy_model():
+    model = NotePadNextFrameCNN(NextFrameBaselineConfig(hidden_channels=16, blocks=1, key_count=18, predict_residual=True))
+    frames = torch.rand(2, 3, 96, 96).mul(2).sub(1)
+    actions = torch.zeros(2, 4)
+
+    pred = model(frames, actions)
+
+    assert torch.allclose(pred, frames)

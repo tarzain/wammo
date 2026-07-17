@@ -27,6 +27,7 @@ class NextFrameBaselineConfig:
     blocks: int = 4
     key_count: int = 18
     max_delta: float = 8.0
+    predict_residual: bool = True
 
 
 class ResidualBlock(nn.Module):
@@ -57,11 +58,17 @@ class NotePadNextFrameCNN(nn.Module):
         )
         self.blocks = nn.Sequential(*[ResidualBlock(hidden) for _ in range(config.blocks)])
         self.out = nn.Conv2d(hidden, 3, kernel_size=3, padding=1)
+        if config.predict_residual:
+            nn.init.zeros_(self.out.weight)
+            nn.init.zeros_(self.out.bias)
 
     def forward(self, frame: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         action_planes = action_to_planes(action, frame.shape[-2:], self.config.key_count)
         hidden = self.stem(torch.cat([frame, action_planes], dim=1))
-        return torch.tanh(self.out(self.blocks(hidden)))
+        pred = self.out(self.blocks(hidden))
+        if self.config.predict_residual:
+            return (frame + pred).clamp(-1.0, 1.0)
+        return torch.tanh(pred)
 
 
 class NotePadFramePairs:
@@ -327,6 +334,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-episodes", type=int, default=16)
     parser.add_argument("--hidden-channels", type=int, default=64)
     parser.add_argument("--blocks", type=int, default=4)
+    parser.add_argument("--predict-residual", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--changed-pixel-weight", type=float, default=64.0)
     parser.add_argument("--motion-oversample", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--generate-progress-every", type=int, default=100)
@@ -354,6 +362,7 @@ def main() -> None:
         blocks=args.blocks,
         key_count=len(spec["keys"]),
         max_delta=float(spec["cursor"]["max_delta"]),
+        predict_residual=args.predict_residual,
     )
     model = NotePadNextFrameCNN(config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
